@@ -237,8 +237,46 @@ The analysis layer uses the Responses API with
 The LLM selects salient IDs from supplied deterministic facts, and Python
 renders their sentences. This intentionally constrained MVP prevents invented
 numbers and causal claims. It has no forecast dataframe or execution authority.
-No key was available during this run: the live LLM request is **not verified**;
+No key was available during the original Phase 4 run;
 success, invalid output, and failure paths are unit-tested with mocks, at no cost.
+
+### OpenAI audit metadata
+
+New `artifacts/agent_runs/<run_id>.json` files include a top-level `openai` object
+(also attached to the existing analysis result): response ID, returned model,
+requested model, execution/API response statuses, server `created_at` when
+provided, UTC request start/end, locally measured monotonic `latency_ms`, and
+token usage. Only `x-request-id` is read from response headers for the optional
+`openai_request_id`; full headers are not persisted. Field meanings follow the
+[Responses schema](https://developers.openai.com/api/reference/python/resources/responses/methods/retrieve)
+and [request-ID documentation](https://developers.openai.com/api/reference/overview#debugging-requests).
+
+Missing token counts are `null`, never estimated. Nested usage retains only
+allowlisted nonnegative aggregate counters (for example cached/reasoning tokens);
+unknown fields are ignored. Missing or malformed usage does not fail analysis.
+`called=true` means a request was attempted, not proof that a server received it
+after a network failure. Skips record `called=false` and a reason. Failures keep
+timings, any received IDs/usage, and a fixed safe error message, never raw provider
+errors or stack traces. `response_status` preserves the API status separately
+when local fact-selection validation fails. Uninstrumented legacy/custom adapters
+record `called=null`; old audit files are left unchanged.
+
+API keys are never persisted. Full LLM prompts, request bodies, authorization
+headers, cookies, and hidden instructions are not stored. Prompt audit records
+only analysis type, template version, and fact count; the existing run context
+already supplies turbine IDs, forecast origin, and run ID. Schema-validated LLM
+fact selection cannot change deterministic numerical forecasts, timestamps,
+weather runs, warnings, model identity, horizons, or QC.
+
+Audit-patch verification: 51 tests passed (12 additional mocked cases), compile
+checks passed. Exactly one live call was executed on 2026-09-23 after the tests:
+run `3e41a55d2a4d4b35a2cbac8db2371629`, HTTP 200, returned model
+`gpt-4.1-mini-2025-04-14`, status `completed`, latency 3609 ms, usage 760 input +
+29 output = 789 tokens. Response ID and request ID are recorded in that run's
+audit. The forecast CSV matched the earlier run in every column except the new
+`run_id`; no original audit files were rewritten. Tests use synthetic credentials
+only, and no API credits. Existing NumPy timedelta deprecation warnings remain
+outside this isolated audit patch.
 
 `replay-february` always disables network and LLM calls. It replays all 29 origins
 through the same orchestrator, saves new immutable run records and separate

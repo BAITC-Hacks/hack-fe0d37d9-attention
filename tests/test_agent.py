@@ -276,3 +276,153 @@ def test_openai_failure_does_not_erase_deterministic_result(setup_agent, monkeyp
     assert result.path.exists()
     assert audit["status"] == "completed"
     assert audit["analysis"]["status"] == "failed"
+
+
+AUDIT_TEST_SECRET = "sk-unit-test-audit-secret-not-a-real-key"
+
+
+def audit_response(usage=True):
+    payload = dict(id="resp_audit_fixture", model="gpt-4.1-mini-2025-04-14", status="completed",
+                   created_at=1741386163, instructions="PRIVATE_PROMPT_MUST_NOT_BE_LOGGED",
+                   output=[{"type": "message", "content": [{"type": "output_text",
+                       "text": '{"fact_ids": ["T1_means", "limitations"]}'}]}])
+    if usage:
+        payload["usage"] = dict(input_tokens=123, output_tokens=45, total_tokens=168,
+                               input_tokens_details=dict(cached_tokens=100, secret=AUDIT_TEST_SECRET),
+                               output_tokens_details=dict(reasoning_tokens=10),
+                               unknown_private_field=AUDIT_TEST_SECRET)
+    response = Response(payload=payload)
+    response.headers = {"x-request-id": "req_audit_fixture", "Authorization": AUDIT_TEST_SECRET,
+                        "Set-Cookie": AUDIT_TEST_SECRET}
+    return response
+
+
+class AuditSession:
+    def __init__(self, response):
+        self.response = response
+        self.calls = 0
+
+    def post(self, *args, **kwargs):
+        self.calls += 1
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def test_openai_audit_success_usage_timing_privacy_and_integrity(setup_agent, monkeypatch):
+    import src.analysis_layer as layer
+    agent, _ = setup_agent
+    before = agent.run("2026-02-10", no_llm=True)
+    session = AuditSession(audit_response())
+    monkeypatch.setenv("OPENAI_API_KEY", AUDIT_TEST_SECRET)
+    # Wall clock moves backwards; latency must still be exactly monotonic elapsed.
+    monotonic = iter([100.0, 101.25])
+    wall = iter(["2026-09-23T11:00:01+00:00", "2026-09-23T11:00:00+00:00"])
+    monkeypatch.setattr(layer.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(layer, "_utc_now", lambda: next(wall))
+    agent.analysis_tool = lambda summary: analyze_forecast_with_llm(summary, session)
+    result = agent.run("2026-02-10")
+    audit = latest_audit(agent.root)
+    meta = audit["openai"]
+    assert session.calls == 1
+    assert meta["called"] is True and meta["status"] == "completed"
+    assert meta["response_id"] == "resp_audit_fixture"
+    assert meta["openai_request_id"] == "req_audit_fixture"
+    assert meta["model"] == "gpt-4.1-mini-2025-04-14"
+    assert meta["created_at"] == 1741386163
+    assert meta["request_started_at_utc"].endswith("+00:00")
+    assert meta["request_completed_at_utc"].endswith("+00:00")
+    assert meta["latency_ms"] == 1250.0
+    assert meta["usage"] == dict(input_tokens=123, output_tokens=45, total_tokens=168,
+                                  input_tokens_details=dict(cached_tokens=100), output_tokens_details=dict(reasoning_tokens=10))
+    assert meta["prompt_template_version"] == "v1" and meta["facts_supplied_count"] > 0
+    assert meta == json.loads((result.path.parent / "analysis.json").read_text())["openai"]
+    serialized = json.dumps(audit)
+    for forbidden in (AUDIT_TEST_SECRET, "Authorization", "Set-Cookie", "PRIVATE_PROMPT", "You are a forecast analyst"):
+        assert forbidden not in serialized
+    first, second = (pd.read_csv(path) for path in (before.path, result.path))
+    fields = ["predicted_power", "valid_time_utc", "forecast_origin_utc", "weather_run_init_utc", "model_name", "lead_time_hours"]
+    pd.testing.assert_frame_equal(first[fields], second[fields])
+    assert before.summary["warnings"] == result.summary["warnings"]
+
+
+@pytest.mark.parametrize("usage", [None, [], {"input_tokens": "private", "output_tokens": -1, "total_tokens": True}])
+def test_openai_missing_or_malformed_usage_is_optional(setup_agent, monkeypatch, usage):
+    agent, _ = setup_agent
+    summary = agent.run("2026-02-10", no_llm=True).summary
+    monkeypatch.setenv("OPENAI_API_KEY", AUDIT_TEST_SECRET)
+    response = audit_response(usage=False)
+    if usage is not None:
+        response.payload["usage"] = usage
+    del response.headers  # Optional request ID header is absent, too.
+    meta = analyze_forecast_with_llm(summary, AuditSession(response))["openai"]
+    assert meta["status"] == "completed"
+    assert meta["usage"] == dict(input_tokens=None, output_tokens=None, total_tokens=None)
+    assert meta["openai_request_id"] is None
+
+
+@pytest.mark.parametrize("disabled", ["no_llm", "no_key"])
+def test_openai_skipped_audit_has_no_call(setup_agent, monkeypatch, disabled):
+    agent, _ = setup_agent
+    if disabled == "no_key":
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        skipped = analyze_forecast_with_llm({})
+        assert skipped["openai"]["called"] is False
+    else:
+        monkeypatch.setenv("OPENAI_API_KEY", AUDIT_TEST_SECRET)
+    agent.analysis_tool = lambda _: pytest.fail("Skipped path must not contact OpenAI")
+    agent.run("2026-02-10", no_llm=disabled == "no_llm")
+    meta = latest_audit(agent.root)["openai"]
+    assert meta["called"] is False and meta["status"] == "skipped" and meta["reason"]
+
+
+@pytest.mark.parametrize("failure", ["network", "http", "invalid_json", "incomplete", "selection"])
+def test_failed_openai_audit_preserves_safe_metadata(setup_agent, monkeypatch, failure):
+    agent, _ = setup_agent
+    monkeypatch.setenv("OPENAI_API_KEY", AUDIT_TEST_SECRET)
+    response = audit_response()
+    if failure == "network":
+        response = requests.ConnectionError(f"Authorization: Bearer {AUDIT_TEST_SECRET} PRIVATE_PROMPT")
+    elif failure == "http":
+        response = Response(401, {"error": {"message": AUDIT_TEST_SECRET}})
+    elif failure == "invalid_json":
+        def fail_json():
+            raise ValueError(AUDIT_TEST_SECRET)
+        response.json = fail_json
+    elif failure == "incomplete":
+        response.payload["status"] = "incomplete"
+    else:
+        response.payload["output"][0]["content"][0]["text"] = json.dumps(
+            dict(fact_ids=["T1_means"], predicted_power=999, instructions=AUDIT_TEST_SECRET))
+    session = AuditSession(response)
+    agent.analysis_tool = lambda summary: analyze_forecast_with_llm(summary, session)
+    result = agent.run("2026-02-10")
+    audit = latest_audit(agent.root)
+    meta = audit["openai"]
+    assert session.calls == 1 and meta["called"] is True
+    assert meta["status"] == "failed" and meta["error_type"]
+    assert meta["request_started_at_utc"] and meta["request_completed_at_utc"]
+    assert meta["latency_ms"] >= 0
+    assert audit["status"] == "completed" and result.path.exists()
+    assert audit["tool_calls"][-1]["tool"] == "analyze_forecast_with_llm"
+    assert audit["tool_calls"][-1]["status"] == "failed"
+    if failure in ("incomplete", "selection"):
+        assert meta["response_id"] == "resp_audit_fixture"
+        assert meta["usage"]["input_tokens"] == 123
+        assert meta["response_status"] == ("incomplete" if failure == "incomplete" else "completed")
+    for content in (json.dumps(audit), (result.path.parent / "analysis.json").read_text()):
+        assert AUDIT_TEST_SECRET not in content and "PRIVATE_PROMPT" not in content
+    assert pd.read_csv(result.path).predicted_power.between(0, 1).all()
+
+
+def test_uninstrumented_adapter_error_does_not_leak_or_claim_a_call(setup_agent, monkeypatch):
+    agent, _ = setup_agent
+    monkeypatch.setenv("OPENAI_API_KEY", AUDIT_TEST_SECRET)
+    def fail(_):
+        raise RuntimeError(f"{AUDIT_TEST_SECRET}: PRIVATE_PROMPT")
+    agent.analysis_tool = fail
+    agent.run("2026-02-10")
+    audit = latest_audit(agent.root)
+    assert audit["openai"]["called"] is None
+    assert AUDIT_TEST_SECRET not in json.dumps(audit)
+    assert "PRIVATE_PROMPT" not in json.dumps(audit)

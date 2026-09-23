@@ -11,7 +11,7 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
-from .analysis_layer import analyze_forecast_with_llm
+from .analysis_layer import ANALYSIS_FAILURE, OpenAIAnalysisError, analyze_forecast_with_llm, skipped_openai
 from .config import ARTIFACTS_DIR
 from .evaluation import daily_origins
 from .forecasting import (
@@ -51,7 +51,7 @@ class ForecastOrchestrator:
         audit = dict(run_id=uuid4().hex, agent_start_time=pd.Timestamp.now(tz="UTC").isoformat(),
                      tool_calls=[], warnings=[], errors=[], status="running", recalculation=False,
                      model_version=self.manifest["model_version"], model_artifacts=self.manifest["files"],
-                     turbines=list(turbines))
+                     turbines=list(turbines), openai=skipped_openai("Analysis step not reached"))
         event_start = len(self.client.events)
 
         def call(name, function, *args, **kwargs):
@@ -62,7 +62,10 @@ class ForecastOrchestrator:
                 record["status"] = "passed"
                 return value
             except Exception as error:
-                record.update(status="failed", error_type=type(error).__name__, error=str(error))
+                # An arbitrary analysis adapter may raise with credentials or prompts
+                # in its message; never serialize that message at this outer boundary.
+                message = ANALYSIS_FAILURE if name == "analyze_forecast_with_llm" else str(error)
+                record.update(status="failed", error_type=type(error).__name__, error=message)
                 raise
             finally:
                 record["ended_at"] = pd.Timestamp.now(tz="UTC").isoformat()
@@ -99,13 +102,21 @@ class ForecastOrchestrator:
             for turbine, values in summary["turbines"].items():
                 print(f"{turbine}: mean normalized power 24h={values['mean_power_24h']:.4f}, 48h={values['mean_power_48h']:.4f}", flush=True)
             if no_llm or not os.getenv("OPENAI_API_KEY"):
-                analysis = dict(status="skipped", reason="--no-llm" if no_llm else "OPENAI_API_KEY not configured")
+                reason = "--no-llm" if no_llm else "OPENAI_API_KEY not configured"
+                analysis = dict(status="skipped", reason=reason, openai=skipped_openai(reason))
             else:
                 try:
                     analysis = call("analyze_forecast_with_llm", self.analysis_tool, copy.deepcopy(summary))
+                except OpenAIAnalysisError as error:
+                    analysis = dict(status="failed", reason=ANALYSIS_FAILURE, openai=error.openai)
+                    audit["warnings"].append(analysis["reason"])
                 except Exception:
                     analysis = dict(status="failed", reason="Optional analysis failed; validated forecast unchanged")
                     audit["warnings"].append(analysis["reason"])
+            # Legacy/custom analysis adapters may not supply request instrumentation.
+            # Do not claim a real API call just because such an adapter returned text.
+            audit["openai"] = analysis.get("openai", dict(called=None, status=analysis["status"],
+                                                        reason="Analysis adapter supplied no OpenAI request metadata"))
             write_json(analysis, result.path.parent / "analysis.json")
             audit.update(analysis=analysis, status="completed")
             print(analysis.get("text", f"AI analysis: {analysis['status']} ({analysis.get('reason', '')})"), flush=True)
