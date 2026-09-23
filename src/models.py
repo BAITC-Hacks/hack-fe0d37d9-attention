@@ -14,6 +14,16 @@ def clip_predictions(values: np.ndarray | pd.Series) -> np.ndarray:
     return np.clip(np.asarray(values, dtype=float), 0.0, 1.0)
 
 
+def _oof_history(ordered: pd.DataFrame, block: pd.DataFrame, time_column: str) -> pd.DataFrame:
+    cutoff = block[time_column].min()
+    if "forecast_origin_utc" in block:
+        cutoff = min(cutoff, pd.to_datetime(block["forecast_origin_utc"], utc=True).min())
+    history = ordered.loc[ordered[time_column].lt(cutoff)]
+    if "forecast_origin_utc" in history:
+        history = history.loc[pd.to_datetime(history["forecast_origin_utc"], utc=True).lt(cutoff)]
+    return history
+
+
 class EmpiricalPowerCurve:
     """Turbine-specific, transparent binned mean power curve."""
 
@@ -80,7 +90,7 @@ def chronological_oof_power_curve_predictions(
     for start in range(0, len(unique_times), block_size):
         block_times = unique_times[start : start + block_size]
         block_start = block_times[0]
-        history = ordered.loc[ordered[time_column].lt(block_start)]
+        history = _oof_history(ordered, ordered.loc[ordered[time_column].isin(block_times)], time_column)
         if len(history) < min_history_rows:
             continue
         curve_training = history.rename(columns={wind_column: "wind_speed"})
@@ -119,7 +129,7 @@ def chronological_oof_wind_calibration(
     for start in range(0, len(unique_times), block_size):
         block_times = unique_times[start : start + block_size]
         block_start = block_times[0]
-        history = ordered.loc[ordered[time_column].lt(block_start)]
+        history = _oof_history(ordered, ordered.loc[ordered[time_column].isin(block_times)], time_column)
         block = ordered.loc[ordered[time_column].isin(block_times)]
         for turbine_id, block_group in block.groupby("turbine_id", sort=False):
             turbine_history = history.loc[
@@ -168,9 +178,9 @@ def chronological_oof_cross_domain_power_curve_predictions(
         history_columns = ["turbine_id", "power", curve_wind_column]
         if "suspected_unavailability" in ordered:
             history_columns.append("suspected_unavailability")
-        history = ordered.loc[
-            ordered[time_column].lt(block_start), history_columns
-        ].dropna(subset=["turbine_id", "power", curve_wind_column])
+        history = _oof_history(
+            ordered, ordered.loc[ordered[time_column].isin(block_times)], time_column
+        )[history_columns].dropna(subset=["turbine_id", "power", curve_wind_column])
         if len(history) < min_history_rows:
             continue
         curve_training = history.rename(columns={curve_wind_column: "wind_speed"})

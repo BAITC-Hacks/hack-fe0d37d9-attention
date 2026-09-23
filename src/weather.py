@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,7 @@ import pandas as pd
 import requests
 
 from .config import DATA_CACHE_DIR, DEFAULT_AVAILABILITY_LAG_HOURS
-from .leakage import validate_weather_samples
+from .leakage import LeakageError, validate_weather_samples
 
 
 SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
@@ -42,6 +43,10 @@ EXPECTED_HOURLY_UNITS = {
 
 class WeatherArchiveError(RuntimeError):
     """Raised when an archived forecast cannot be retrieved or validated."""
+
+
+class WeatherRunUnavailable(WeatherArchiveError):
+    """Only this failure permits trying an older eligible initialization."""
 
 
 def ensure_utc(value: pd.Timestamp | str) -> pd.Timestamp:
@@ -111,11 +116,27 @@ class OpenMeteoSingleRunsClient:
         availability_lag_hours: int = DEFAULT_AVAILABILITY_LAG_HOURS,
         timeout_seconds: int = 60,
         session: requests.Session | None = None,
+        max_retries: int = 2,
+        max_older_runs: int = 2,
+        backoff_seconds: float = 1.0,
+        cache_only: bool = False,
+        sleeper=time.sleep,
     ) -> None:
         self.cache_dir = Path(cache_dir)
         self.availability_lag_hours = availability_lag_hours
         self.timeout_seconds = timeout_seconds
         self.session = session or requests.Session()
+        if max_retries < 0 or max_older_runs < 0 or backoff_seconds < 0:
+            raise ValueError("Retry settings must be nonnegative")
+        self.max_retries = max_retries
+        self.max_older_runs = max_older_runs
+        self.backoff_seconds = backoff_seconds
+        self.cache_only = cache_only
+        self.sleeper = sleeper
+        self.events: list[dict] = []
+
+    def _event(self, action: str, **details) -> None:
+        self.events.append(dict(action=action, at_utc=pd.Timestamp.now(tz="UTC").isoformat(), **details))
 
     def _request_parameters(
         self,
@@ -158,6 +179,7 @@ class OpenMeteoSingleRunsClient:
     ) -> tuple[bytes, dict[str, Any], bool]:
         raw_path, metadata_path = self._paths(cache_key)
         if raw_path.exists() and metadata_path.exists():
+            self._event("cache_hit", cache_key=cache_key, run=parameters["run"])
             raw = raw_path.read_bytes()
             try:
                 return raw, json.loads(raw.decode("utf-8")), True
@@ -166,18 +188,33 @@ class OpenMeteoSingleRunsClient:
                     f"Cached archived weather response {raw_path.name} is invalid"
                 ) from error
 
-        try:
-            response = self.session.get(
-                SINGLE_RUNS_URL,
-                params=parameters,
-                timeout=self.timeout_seconds,
-            )
-        except requests.RequestException as error:
-            raise WeatherArchiveError(
-                f"Open-Meteo archived run request failed: {error}"
-            ) from error
+        self._event("cache_miss", cache_key=cache_key, run=parameters["run"])
+        if self.cache_only:
+            raise WeatherRunUnavailable("Archived run absent from cache; network disabled")
+        for attempt in range(self.max_retries + 1):
+            self._event("network_request", run=parameters["run"], attempt=attempt + 1)
+            try:
+                response = self.session.get(SINGLE_RUNS_URL, params=parameters, timeout=self.timeout_seconds)
+            except requests.RequestException as error:
+                if attempt == self.max_retries:
+                    raise WeatherArchiveError("Archived weather network retries exhausted") from error
+                self._event("retry", reason=type(error).__name__, delay_seconds=self.backoff_seconds * 2**attempt)
+                self.sleeper(self.backoff_seconds * 2**attempt)
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt == self.max_retries:
+                    raise WeatherArchiveError(f"Archived weather HTTP {response.status_code}: retries exhausted")
+                self._event("retry", reason=f"HTTP {response.status_code}", delay_seconds=self.backoff_seconds * 2**attempt)
+                self.sleeper(self.backoff_seconds * 2**attempt)
+                continue
+            break
         if not response.ok:
             snippet = response.text[:500]
+            explicit_missing = response.status_code == 400 and "run" in snippet.lower() and any(
+                marker in snippet.lower() for marker in ("not found", "not available", "unavailable")
+            )
+            if response.status_code in (404, 410) or explicit_missing:
+                raise WeatherRunUnavailable(f"Archived run {parameters['run']} unavailable (HTTP {response.status_code})")
             raise WeatherArchiveError(
                 f"Open-Meteo did not provide archived run {parameters['run']} "
                 f"(HTTP {response.status_code}): {snippet}"
@@ -243,14 +280,36 @@ class OpenMeteoSingleRunsClient:
         horizon_hours: int = 48,
     ) -> WeatherForecast:
         """Return exactly the next `horizon_hours` valid UTC hours for one origin."""
-        if horizon_hours < 1:
-            raise ValueError("horizon_hours must be at least 1")
         origin = ensure_utc(forecast_origin)
         selected_run, cutoff = select_latest_available_run(
             origin, self.availability_lag_hours
         )
+        for step in range(self.max_older_runs + 1):
+            run = selected_run - pd.Timedelta(6 * step, unit="h")
+            try:
+                forecast = self.get_forecast_from_run(latitude, longitude, origin, run, horizon_hours)
+                if step:
+                    self._event("older_run_selected", run=run.isoformat(), fallback_steps=step)
+                return forecast
+            except WeatherRunUnavailable:
+                self._event("run_unavailable", run=run.isoformat(), fallback_steps=step)
+                if step == self.max_older_runs:
+                    raise
+        raise AssertionError("Unreachable run-selection branch")
+
+    def get_forecast_from_run(self, latitude: float, longitude: float,
+                              forecast_origin: pd.Timestamp | str, selected_run: pd.Timestamp | str,
+                              horizon_hours: int = 48) -> WeatherForecast:
+        """Explicit replay run; never allows a caller to bypass the availability gate."""
+        if not 1 <= horizon_hours <= 48:
+            raise ValueError("horizon_hours must be between 1 and 48")
+        origin = ensure_utc(forecast_origin)
+        selected_run = ensure_utc(selected_run)
+        latest, cutoff = select_latest_available_run(origin, self.availability_lag_hours)
+        if origin != origin.floor("h") or selected_run != selected_run.floor("6h"):
+            raise ValueError("Origin must be hourly and run must be a six-hour initialization")
         if selected_run > cutoff:
-            raise AssertionError("Selected run is after availability cutoff")
+            raise LeakageError("Requested weather run is after availability cutoff")
         parameters = self._request_parameters(
             latitude, longitude, origin, selected_run, horizon_hours
         )
@@ -295,7 +354,7 @@ class OpenMeteoSingleRunsClient:
             raw_response_sha256=raw_hash,
             request_parameters=parameters,
             cache_key=cache_key,
-            fallback_steps=0,
+            fallback_steps=int((latest - selected_run).total_seconds() / (6 * 3600)),
         )
         if not cache_hit:
             _, metadata_path = self._paths(cache_key)
@@ -311,7 +370,11 @@ class OpenMeteoSingleRunsClient:
                 raise WeatherArchiveError(
                     f"Cached weather provenance hash does not match {cache_key}"
                 )
-            metadata = WeatherMetadata(**cached)
+            if cached.get("request_parameters") != parameters or cached.get("provider") != PROVIDER or cached.get("model") != MODEL:
+                raise WeatherArchiveError("Cached weather request provenance mismatch")
+            # A cache entry describes the acquisition; availability/fallback
+            # describe this invocation and must never be inherited from an old policy.
+            metadata = replace(metadata, retrieval_timestamp=cached["retrieval_timestamp"])
 
         forecast["forecast_origin_utc"] = origin
         forecast["weather_run_init_utc"] = selected_run

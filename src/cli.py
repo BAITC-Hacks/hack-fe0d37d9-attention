@@ -397,7 +397,78 @@ def build_parser() -> argparse.ArgumentParser:
     phase2a.add_argument("--diagnostic-start-date", default="2025-12-01")
     phase2a.add_argument("--diagnostic-end-date", default="2026-01-29")
     phase2a.set_defaults(func=command_phase2a_build)
+    development = subcommands.add_parser("phase2b-backtest", help="origin-safe four-model walk-forward comparison")
+    development.add_argument("--start-date", default="2025-12-01")
+    development.add_argument("--end-date", default="2026-01-29")
+    development.set_defaults(func=command_development)
+    acceptance = subcommands.add_parser("accept-validation", help="run tests/archive checks and persist an explicit validation review")
+    acceptance.add_argument("--review", required=True, help="scientific review of held-out quality and limitations")
+    acceptance.set_defaults(func=command_acceptance)
+    freeze = subcommands.add_parser("freeze-models", help="freeze selected pre-February turbine models")
+    freeze.set_defaults(func=command_freeze)
+    february = subcommands.add_parser("february-forecast", help="frozen-model rolling archived forecasts; no SCADA")
+    february.set_defaults(func=command_february)
+    agent = subcommands.add_parser("agent-forecast", help="audited tool-based forecast; naive origin is Asia/Almaty")
+    agent.add_argument("--origin", required=True)
+    agent.add_argument("--turbines", default="T1,T2")
+    agent.add_argument("--no-llm", action="store_true")
+    agent.add_argument("--cache-only", action="store_true")
+    agent.set_defaults(func=command_agent)
+    replay = subcommands.add_parser("replay-february", help="replay 29 origins through the orchestrator, cache-only/no-LLM")
+    replay.set_defaults(func=command_replay)
     return parser
+
+
+def command_development(args: argparse.Namespace) -> int:
+    from .development import run_model_development
+    run_model_development(args.start_date, args.end_date)
+    return 0
+
+
+def command_freeze(args: argparse.Namespace) -> int:
+    from .development import freeze_final_models
+    freeze_final_models()
+    return 0
+
+
+def command_acceptance(args: argparse.Namespace) -> int:
+    import json
+    import re
+    import subprocess
+    from .archive_audit import verify_training_archive
+    from .development import accept_validation
+    from .config import PROJECT_ROOT
+    tested = subprocess.run([sys.executable, "-W", "ignore::DeprecationWarning", "-m", "pytest", "-q"],
+                            cwd=PROJECT_ROOT, capture_output=True, text=True)
+    print(tested.stdout)
+    if tested.returncode:
+        raise ValueError("Test suite failed; validation gate cannot pass")
+    count = re.search(r"(\d+) passed", tested.stdout)
+    if not count:
+        raise ValueError("Could not verify passing test count")
+    verify_training_archive()
+    print(json.dumps(accept_validation(args.review, int(count.group(1))), indent=2))
+    return 0
+
+
+def command_february(args: argparse.Namespace) -> int:
+    from .forecasting import generate_february
+    generate_february()
+    return 0
+
+
+def command_agent(args: argparse.Namespace) -> int:
+    from .agent import ForecastOrchestrator
+    result = ForecastOrchestrator(client=OpenMeteoSingleRunsClient(cache_only=args.cache_only)).run(
+        args.origin, tuple(part.strip() for part in args.turbines.split(",")), no_llm=args.no_llm)
+    print(f"Forecast saved: {result.path}")
+    return 0
+
+
+def command_replay(args: argparse.Namespace) -> int:
+    from .agent import replay_february
+    replay_february()
+    return 0
 
 
 def _add_scada_timestamp_arguments(parser: argparse.ArgumentParser) -> None:

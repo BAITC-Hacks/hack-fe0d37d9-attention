@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 
 
 class LeakageError(ValueError):
@@ -28,7 +29,7 @@ def validate_weather_samples(samples: pd.DataFrame) -> None:
     for column in WEATHER_TIME_COLUMNS.difference(
         {"lead_time_hours", "availability_lag_hours"}
     ):
-        frame[column] = pd.to_datetime(frame[column], utc=True, errors="raise")
+        frame[column] = require_utc(frame[column], column)
     lead = pd.to_numeric(frame["lead_time_hours"], errors="raise")
     availability_lag = pd.to_numeric(frame["availability_lag_hours"], errors="raise")
     computed_available_at = frame["weather_run_init_utc"] + pd.to_timedelta(
@@ -42,11 +43,53 @@ def validate_weather_samples(samples: pd.DataFrame) -> None:
         | frame["weather_available_at_utc"].gt(frame["forecast_origin_utc"])
         | computed_available_at.ne(frame["weather_available_at_utc"])
         | computed_available_at.gt(frame["forecast_origin_utc"])
+        | ~np.isfinite(availability_lag)
+        | lead.ne((frame["valid_time_utc"] - frame["forecast_origin_utc"]).dt.total_seconds() / 3600)
+        | lead.mod(1).ne(0)
     )
     if invalid.any():
         raise LeakageError(
             f"{int(invalid.sum())} weather samples violate forecast-time availability"
         )
+    derived = {
+        "model_lead_time_hours": (frame["valid_time_utc"] - frame["weather_run_init_utc"]).dt.total_seconds() / 3600,
+        "run_age_at_origin_hours": (frame["forecast_origin_utc"] - frame["weather_run_init_utc"]).dt.total_seconds() / 3600,
+    }
+    for name, expected in derived.items():
+        if name in frame and not pd.to_numeric(frame[name], errors="raise").eq(expected).all():
+            raise LeakageError(f"Inconsistent derived temporal feature: {name}")
+
+
+def require_utc(values: pd.Series, name: str) -> pd.Series:
+    """Reject missing/naive clocks; only explicit aware timestamps may enter the core."""
+    try:
+        parsed = pd.to_datetime(values, errors="raise")
+        if parsed.dt.tz is None or parsed.isna().any():
+            raise ValueError("missing or timezone-naive timestamp")
+        return parsed.dt.tz_convert("UTC")
+    except (ValueError, AttributeError, TypeError) as error:
+        raise LeakageError(f"{name} requires nonmissing timezone-aware timestamps") from error
+
+
+class TemporalLeakageGuard:
+    """Deterministic gate used by training, inference, and orchestration."""
+
+    validate_weather = staticmethod(validate_weather_samples)
+
+    @staticmethod
+    def validate_training(rows: pd.DataFrame, origin: pd.Timestamp) -> None:
+        if origin.tzinfo is None:
+            raise LeakageError("Outer origin must be timezone aware")
+        for name in ("valid_time_utc", "forecast_origin_utc"):
+            if not require_utc(rows[name], name).lt(origin).all():
+                raise LeakageError(f"Training {name} must be strictly before outer origin")
+        # SCADA hourly labels represent [timestamp, timestamp + 1h).
+        if not (require_utc(rows["valid_time_utc"], "valid_time_utc") + pd.Timedelta(hours=1)).le(origin).all():
+            raise LeakageError("Training hour has not finished at outer origin")
+        if rows["valid_time_utc"].dt.tz_convert("Asia/Almaty").ge(
+            pd.Timestamp("2026-02-01", tz="Asia/Almaty")
+        ).any():
+            raise LeakageError("February actual targets are forbidden")
 
 
 def filter_outer_fold_training_rows(
