@@ -1,560 +1,390 @@
-# Leakage-safe wind power forecasting
+# WindAgent AI
 
-Hourly 24-48 hour normalized-power forecasting for two wind turbines. Phases
-2B-4 are implemented and executed: pre-February walk-forward comparison,
-frozen-model February inference, and an auditable tool orchestrator with
-optional OpenAI analysis. Phase 5 adds a Streamlit presentation layer over the
-existing deterministic tools and persisted artifacts.
+**Прогноз нормализованной мощности двух ветровых турбин на 48 часов с проверкой временной доступности данных, журналом работы агента и интерактивным dashboard.**
 
-## Data, locations, and SCADA time
+Проект для HackAlem помогает оператору ветропарка или аналитику увидеть ожидаемую мощность, периоды роста и спада генерации и происхождение прогноза. На вход поступают история турбин из SCADA (системы сбора измерений оборудования) и архивные прогнозы погоды ECMWF; на выходе — почасовой прогноз, графики, CSV и журнал проверок.
 
-The original 10-minute SCADA CSV files are read in place and never modified.
-The pipeline stores timezone-aware UTC timestamps internally, aggregates to
-hours without interpolation, and preserves partial and empty hours for
-diagnostics. A training target must have six unique timestamps at the expected
-00, 10, 20, 30, 40, and 50 minute cadence.
+Мощность представлена числом **от 0 до 1** относительно номинальной мощности турбины. Значение `0.7` означает 70% номинальной мощности. Расчёта энергии в кВт·ч или выручки в текущей версии нет.
 
-| Turbine | Latitude | Longitude |
+## ⚠️ Важно: ветка проекта
+Ветка main используется для документации проекта.
+Рабочий код находится в отдельной ветке: <hackalem-ai>
+После клонирования репозитория необходимо переключиться на неё:
+```bash
+git switch hackalem-ai
+```
+Проверить текущую ветку:
+```bash
+git branch 
+```
+
+
+## 1. Что реализовано
+
+| Компонент | Возможности |
+|---|---|
+| Подготовка данных | Чтение двух исходных SCADA CSV, перевод времени в UTC, агрегация 10-минутных измерений в часы, контроль пропусков и дубликатов |
+| Историческая погода | Получение конкретного запуска ECMWF через Open-Meteo Single Runs, фиксация модели, единиц, времени инициализации и предполагаемой доступности |
+| Обучение | Четыре стратегии: эмпирическая кривая мощности, калибровка ветра с последующей кривой, HistGradientBoosting и гибридный CatBoost |
+| Проверка качества | Последовательный backtest по датам выпуска прогнозов, MAE / RMSE / R², разрезы по турбинам, месяцам и горизонтам |
+| Финальный прогноз | Сохранение моделей и прогнозирование по ежедневным origins с 31 января по 28 февраля 2026 года без дообучения на феврале |
+| Агент | Последовательность инструментов с проверками, повторными запросами погоды, допустимым переходом к более старому запуску и журналированием |
+| AI-анализ | Опциональный выбор значимых фактов через OpenAI; численные прогнозы рассчитываются Python-моделями |
+| Dashboard | Выбор даты и турбины, графики мощности и погоды, показатели на 24/48 часов, история выполнения, сохранённый AI-анализ и сравнение моделей |
+| Воспроизводимость | Кеш исходных погодных ответов, SHA-256, версии моделей, метаданные, отдельные файлы каждого запуска и повторное выполнение без сети |
+
+## 2. Как работает решение
+
+### Пользовательский сценарий
+
+1. Пользователь открывает **WindAgent AI** и выбирает дату выпуска прогноза и турбину T1, T2 или обе.
+2. В режиме **Cached Replay** приложение читает сохранённый прогноз и связанные с ним метаданные.
+3. На вкладке **Generation & weather** отображаются мощность, погода, средняя прогнозная мощность за 24/48 часов и время пика.
+4. На вкладке **Agent Execution & AI** можно проследить выполненные шаги, ошибки, выбранный запуск ECMWF и сохранённое объяснение.
+5. **February Replay** показывает доступность результатов по датам, а **System & validation** — архитектуру, ограничения и метрики из файлов валидации.
+6. При наличии моделей и погодного кеша кнопка **Run agent forecast** запускает новый расчёт для обеих турбин. Предыдущие результаты сохраняются. Фильтр турбины влияет только на отображение.
+
+Чтение dashboard и переключение дат не вызывают погодный API или OpenAI. Новое AI-объяснение запускается отдельной кнопкой; обычный запуск агента из интерфейса выполняется без LLM.
+
+### Что происходит внутри
+
+Для выбранного `forecast_origin` система находит допустимый архивный запуск погоды, проверяет его, создаёт признаки и применяет сохранённую модель каждой турбины. После проверки 48 почасовых значений формируются сводка, CSV и журнал. Опциональный AI-анализ выполняется после численного расчёта и сохранения результата.
+
+`Forecast origin` — момент, когда выпускается прогноз. `Valid time` — час, на который он рассчитан. Горизонт в коде: **O+1, O+2, …, O+48 часов**. Ежедневные origins задаются в `00:00 Asia/Almaty`; внутреннее время хранится в UTC.
+
+## 3. Технологии
+
+| Назначение | Используемые технологии |
+|---|---|
+| Язык | Python; локальная проверка выполнена на Python 3.12.2 |
+| Работа с данными | pandas, NumPy, CSV; Parquet при наличии соответствующего движка |
+| ML | scikit-learn / HistGradientBoostingRegressor, CatBoostRegressor, собственная эмпирическая кривая мощности |
+| Сохранение моделей | joblib, JSON-манифесты, SHA-256 |
+| Интерфейс | Streamlit, Plotly, настройки темы в `.streamlit/config.toml` |
+| HTTP | requests |
+| Погода | Open-Meteo Single Runs API, закреплённая модель `ecmwf_ifs` |
+| Аналитический AI | OpenAI Responses API, модель по умолчанию `gpt-4.1-mini`, настраивается через `OPENAI_MODEL` |
+| Конфигурация и тесты | python-dotenv, pytest, Streamlit AppTest |
+
+Зависимости перечислены в [requirements.txt](requirements.txt). OpenAI вызывается через `requests`; отдельный OpenAI SDK проекту не требуется.
+
+## 4. Архитектура
+
+```mermaid
+flowchart TD
+    S[Исходные CSV турбин] --> Q[Контроль качества SCADA]
+    W[Open-Meteo: конкретные запуски ECMWF] --> C[Кеш ответов и метаданных]
+    Q --> D[Датасет: origin, погода, target]
+    C --> D
+    D --> V[Walk-forward: сравнение четырёх стратегий]
+    V --> G[Проверки и анализ результатов]
+    G --> M[Сохранённые модели T1 и T2]
+    O[Дата выпуска прогноза] --> A[Оркестратор]
+    C --> A
+    M --> A
+    A --> P[Проверенный прогноз и сводка]
+    P --> F[CSV, JSON, журнал запуска]
+    P --> L[Опциональный выбор фактов OpenAI]
+    L --> F
+    F --> U[Streamlit dashboard]
+```
+
+| Файл / каталог | Ответственность |
+|---|---|
+| [app.py](app.py) | Точка входа dashboard |
+| `src/scada.py`, `src/gaps.py` | Загрузка SCADA, покрытие часов и работа с разрывами |
+| `src/weather.py` | Получение архивной погоды, кеш, повторные запросы и выбор старого запуска |
+| `src/leakage.py` | Проверки временных границ и доступности данных |
+| `src/features.py`, `src/training_data.py` | Признаки и точное объединение погоды с targets |
+| `src/models.py`, `src/development.py` | Модели, OOF-признаки, backtest, выбор и сохранение моделей |
+| `src/evaluation.py`, `src/diagnostics.py` | Метрики и диагностические процедуры |
+| `src/archive_audit.py` | Сверка обучающей погоды с исходным кешем |
+| `src/forecasting.py` | Контекст прогноза, расчёт, проверки, сводки и экспорт |
+| `src/agent.py`, `src/analysis_layer.py` | Оркестратор и опциональный AI-анализ |
+| `src/dashboard.py`, `src/dashboard_data.py` | Интерфейс и чтение разрешённых полей артефактов |
+| `src/dashboard_runtime.py` | Запуск агента из UI и загрузка перенесённых моделей по локальным путям |
+| `src/cli.py` | Команды подготовки, проверки и прогнозирования |
+| `tests/` | Тесты данных, временных правил, моделей, агента и интерфейса |
+
+### Роль агента и OpenAI
+
+Агент — один детерминированный оркестратор инструментов. При сетевых ошибках, HTTP 429 и 5xx погодный клиент делает до двух повторов с задержками 1 и 2 секунды. Если конкретный запуск недоступен, допускаются до двух более старых шестичасовых запусков той же модели. Неверные единицы, пропуски или нарушение временных правил приводят к отказу, а не к подмене данных наблюдениями.
+
+OpenAI получает уже вычисленные факты и выбирает до шести их идентификаторов по строгой JSON-схеме. Текст собирает Python из этих фактов. LLM не вычисляет мощность, не меняет погодный запуск и не управляет проверками. При отказе OpenAI численный прогноз сохраняется, а ошибка отражается в журнале. Тексты интерфейса и AI-сводок в коде преимущественно на английском.
+
+## 5. Данные, интеграции и защита от утечки
+
+### История турбин
+
+В корне находятся два исходных файла:
+
+- `Dataset HackAlemAI для участников 11.03.2023-28.02.2026 - turbine 1.csv`;
+- `Dataset HackAlemAI для участников 11.03.2023-28.02.2026 - turbine 2.csv`.
+
+Они содержат ID, время, среднюю скорость ветра, нормализованную активную мощность и среднюю температуру. Исходные файлы читаются без изменения. Часовой target считается полным только при наличии шести уникальных измерений на минутах 00, 10, 20, 30, 40 и 50. Пропуски не интерполируются.
+
+Координаты заданы в [src/config.py](src/config.py):
+
+| Турбина | Широта | Долгота |
 |---|---:|---:|
 | T1 | 43.645150 | 78.535604 |
 | T2 | 43.643198 | 78.538828 |
 
-The source SCADA timestamps have no timezone marker. The default
-`SCADA_TIMESTAMP_MODE=civil_time` applies `Asia/Almaty` historical IANA rules,
-then converts to UTC. `fixed_offset` is available only with an explicitly
-configured `SCADA_FIXED_UTC_OFFSET_HOURS`; neither option proves the organizer
-source-clock convention.
+Временные метки SCADA не содержат часового пояса. По умолчанию применяется `Asia/Almaty` с историческими правилами, включая смену UTC+06 на UTC+05 в 2024 году. Повторяющийся час при переходе трактуется как более раннее вхождение. Это документированное допущение, а не подтверждение конвенции организаторов.
 
-Kazakhstan's 2024-03-01 UTC+06 to UTC+05 transition creates an ambiguous local
-23:00 hour. The raw data records that hour once, so the civil-time policy maps
-it to the earlier UTC+06 occurrence. This is documented rather than inferred;
-timezone-alignment diagnostics must still compare civil time with explicit
-fixed-offset candidates before model selection.
+### Архивные прогнозы погоды
 
-Hub height was not supplied. `wind_speed_100m` is a modelling proxy, not a
-known turbine specification.
+Клиент обращается к `https://single-runs-api.open-meteo.com/v1/forecast` с параметрами конкретного `run`, `models=ecmwf_ifs`, `timezone=UTC`, `timeformat=unixtime` и `wind_speed_unit=ms`.
 
-Inputs are the two original 10-minute CSVs: ID, naive statistical timestamp,
-wind speed, normalized active power (0-1), and ambient temperature. The
-pre-February history begins in March 2023. February SCADA is never consumed by
-model development or inference; these phases use only the guarded Phase 2A
-pre-February dataset. Neither weather observations nor reanalysis are predictors.
+Используются скорость ветра на 10/80/100/120 м, направление на 100 м, температура на 2 м и поверхностное давление. Высота 100 м — модельное приближение: реальная высота ступицы в конфигурации не известна.
 
-## Point-in-time weather contract
+Кеш сохраняет сырой ответ и JSON-метаданные: координаты, параметры запроса, время получения, запуск модели, предполагаемую доступность и SHA-256. Подстановка фактической погоды, реанализа или другой модели не предусмотрена.
 
-Weather is retrieved only from Open-Meteo Single Runs, pinned to archived ECMWF
-IFS HRES (`ecmwf_ifs`). Requests explicitly set `wind_speed_unit=ms`,
-`timezone=UTC`, and `timeformat=unixtime`. No observations, reanalysis, or
-un-pinned provider model may substitute for a missing archived run.
+### Временные правила
 
-Historical **observations** describe what actually happened. Reanalysis blends
-observations and later processing. Historical **forecasts** describe predictions
-issued in the past. A Single Run pins one model initialization, unlike a stitched
-archive that may mix issue times. Initialization is not publication: the seven-hour
-lag is an explicit conservative assumption, not verified publication telemetry.
-See [Open-Meteo Single Runs documentation](https://open-meteo.com/en/docs/single-runs-api).
+- Для погоды требуется `weather_run_init_utc + 7h <= forecast_origin_utc`. Семь часов — настраиваемое допущение о задержке публикации, а не измеренный исторический факт.
+- `lead_time_hours` должен соответствовать разнице target и origin и находиться в диапазоне 1–48.
+- Для обучения используются только более ранние origins и targets; час SCADA должен завершиться к моменту выпуска внешнего прогноза.
+- Фактические ветер и мощность используются как labels и для диагностики, но не как будущие признаки при inference.
+- Новый цикл обучения строит OOF-признаки отдельно для каждого origin: прогноз кривой для примера рассчитывается без обучения на его target и ещё неизвестных данных. Старые OOF-столбцы подготовки Phase 2A игнорируются.
+- Подозрение на недоступность турбины исключает запись из обучения, но полные наблюдаемые часы с таким флагом остаются в основных метриках.
+- Февральские targets запрещены в новом цикле разработки моделей. Февральский inference использует замороженную модель и новую допустимую архивную погоду.
 
-The default availability lag is seven hours. For every sample, the following
-invariants are checked:
+## 6. Установка и быстрый запуск
 
-- `weather_run_init_utc + availability_lag <= forecast_origin_utc`;
-- `weather_available_at_utc <= forecast_origin_utc`;
-- `valid_time_utc > forecast_origin_utc` and lead time is 1 through 48 hours.
+Команды выполняются **из корня репозитория**. Для воспроизведения проверенного окружения используйте Python 3.12. Интернет нужен для установки пакетов и загрузки отсутствующей погоды; для просмотра готовых результатов ключи не требуются.
 
-Each cache entry has raw response and metadata sidecars. Metadata records the
-origin, run initialization, availability time, provider/model, coordinates,
-request parameters, retrieval time, and raw-response SHA-256.
+### macOS / Linux
 
-The hackathon forecast-origin convention is `00:00 Asia/Almaty` per day,
-converted to UTC before retrieval and persistence. It is not confused with
-00:00 UTC.
-
-## Leakage rules and modelling status
-
-SCADA wind, temperature, and power are historical labels or post-forecast
-diagnostics only. They are not forecast-time features. At outer origin `O`, a
-training sample requires both `forecast_origin_utc < O` and
-`valid_time_utc < O`; a past-origin forecast whose target lies after `O` is
-rejected.
-
-`TemporalLeakageGuard` also requires aware, nonmissing clocks, consistent lead
-features, and completed training hours (`valid_time + 1 hour <= origin`). Joins
-are exact UTC joins, never nearest-time. Missing target hours remain missing.
-Gap utilities reindex the hourly timeline and segment it before any future
-rolling calculations; primary predictors do not use target lags.
-
-High-wind zero-power records are retained in operational backtest metrics. They
-are flagged as `zero_power_high_wind` and `suspected_unavailability`; only the
-latter is excluded from model and power-curve fitting. Empirical power curves
-are separate for T1 and T2. If a power-curve prediction is used as a model
-feature, it must be generated through chronological expanding-window OOF
-predictions, never in sample.
-
-The original Phase 1 accuracy figures predate the temporal audit and are not
-valid evidence for model choice. Phase 2B now compares four fixed strategies
-on daily December/January origins before any February inference.
-
-## Phase 2A archived-forecast dataset
-
-Phase 2A uses daily 00:00 Asia/Almaty origins from 2025-10-01 through
-2026-01-29. It produced 11,616 archived ECMWF forecast rows, with 48 leads for
-each of two turbines and 121 origins. The CSV fallback is used because no
-Parquet engine is installed.
-
-Timezone diagnostics use only December 2025-January 2026 exact UTC matches.
-Civil time and fixed UTC+05:00 are identical during this period. Fixed UTC+06:00
-has a small, mixed wind difference but better temperature alignment, so the
-result is inconclusive and the configured civil-time default is retained. The
-diagnostic never changes production configuration automatically.
-
-Wind correlations were approximately 0.7025 at 10m and 0.7194 at 80/100/120m.
-These diagnostics do not establish a physical hub height; 100m remains the
-documented primary proxy. Other levels remain available as ML inputs.
-
-The data artifact contains archived weather, calendar features, target labels,
-coverage flags, and OOF-only direct/calibrated power-curve preparation fields.
-Power-curve OOF summaries are diagnostic preparation, not a model-selection
-result. Generated files are under `artifacts/datasets/` and
-`artifacts/diagnostics/`.
-
-Phase 2B corrected the OOF preparation to use forecast-origin cutoffs, not only
-target-time blocks. Old Phase 2A OOF columns are ignored by model development.
-The new `origin_oof_curve_features.csv` records each curve fit's maximum label
-time. Curve fitting de-duplicates realised SCADA hours across forecast origins.
-
-The four strategies are separate turbine-specific empirical curves, forecast
-wind calibrated with HistGradientBoosting then passed through the curves,
-direct HistGradientBoosting power regression, and separate hybrid CatBoost
-models using origin-safe OOF curve predictions. CatBoost has one deterministic
-configuration (450 trees, depth 6, learning rate 0.05, RMSE loss).
-
-Primary metrics include every complete observed hour, including suspected
-unavailability. Partial 48-hour target folds are explicitly marked and a
-full-fold-only comparison is saved alongside the primary comparison. Model
-selection uses held-out MAE, with a predeclared 0.002 simplicity tie tolerance.
-
-## Executed model comparison and selection
-
-Validation uses **60 daily origins**: December 1-31 and January 1-29, local
-midnight. All four candidates refit using only targets and forecast origins
-strictly earlier than the current outer origin. No random split, early-stopping
-random validation, February tuning, or large hyperparameter search.
-Monthly reports are grouped by the local **forecast-origin** month, not the
-target month; a December 31 forecast can therefore score January 1 targets.
-
-| Strategy | December MAE | January MAE | Combined MAE | Combined RMSE | Combined R² |
-|---|---:|---:|---:|---:|---:|
-| A: direct ECMWF 100m → SCADA empirical curve | 0.222549 | 0.157537 | **0.190973** | 0.282276 | 0.398645 |
-| B: forecast weather → calibrated wind → curve | 0.214218 | 0.168369 | 0.191950 | 0.280306 | 0.407009 |
-| C: HistGradientBoosting → power | 0.230339 | 0.184247 | 0.207952 | 0.277975 | 0.416828 |
-| D: hybrid CatBoost + chronological OOF curve | 0.236792 | 0.187941 | 0.213065 | 0.280565 | 0.405911 |
-
-December N=2,948; January N=2,784; pooled N=5,732 scored forecast/target pairs
-per strategy. Overlapping horizons intentionally score each issued forecast;
-these are **not independent unique observed hours**. There are 112 complete
-48-hour turbine folds and 8 explicitly partial target folds. The full-fold-only
-comparison scores 5,376 pairs: A MAE=0.186336, B=0.192054, C=0.208450,
-D=0.215211. Primary metrics include suspected unavailability.
-
-**Selected: A, separate empirical curves for T1 and T2.** It minimizes held-out
-MAE and is simplest within the declared tie tolerance. It is transparent, but
-does not eliminate forecast-to-SCADA domain shift. B has much smaller bias and
-better December/worst-day behavior; C has slightly better RMSE. Neither has lower
-pooled MAE. No claim that the selected baseline is best for every operating cost.
-
-| Selected A, combined months | N | MAE | RMSE | R² | Capacity error, pp |
-|---|---:|---:|---:|---:|---:|
-| T1, 1-48h | 2,872 | 0.189175 | 0.279353 | 0.415544 | 18.918 |
-| T2, 1-48h | 2,860 | 0.192779 | 0.285181 | 0.381131 | 19.278 |
-| Both, 1-24h | 2,866 | 0.184555 | 0.272472 | 0.439688 | 18.456 |
-| Both, 25-48h | 2,866 | 0.197391 | 0.291751 | 0.357572 | 19.739 |
-
-Pooled MAE is 19.097 percentage points of rated normalized capacity. Important
-failure pattern: negative residual bias (-0.114151). At actual power >=0.95,
-T1/T2 mean residuals are approximately -0.306/-0.324. At actual power <=0.02,
-MAE is about 0.055/0.056. Longer leads are worse. All models have saved
-breakdowns by lead, turbine, forecast wind bucket, generation bucket, local
-hour, month, near-rated output, and very low generation. No training metric
-was used to establish these results.
-
-The original Phase 2A OOF scores are superseded for selection: an audit found
-that target-block cutoffs could precede a block's target times yet follow its
-historical forecast origin. This was fixed; the new hybrid uses origin-safe
-OOF features with a seven-day warm-up. No old OOF predictions are reused.
-
-## Frozen models and February outputs
-
-Model version: `34979ef7f8ba489c9c4ee7391c51bfbc`. Training cutoff is
-**2026-01-30 19:00 UTC = January 31 00:00 Asia/Almaty**, before the first
-transition forecast. Maximum training target timestamp is 2026-01-30 18:00 UTC.
-The frozen fit uses 11,358 eligible forecast-origin rows; realised SCADA hours
-are deduplicated when fitting each empirical curve. T1/T2 joblib files include
-the fitted curve; model hashes, feature schema, seed, parameters, dataset hash,
-package versions, and cutoff are recorded in the versioned manifest.
-
-Origins run **January 31 through February 28**, each at 00:00 Asia/Almaty.
-Including January 31 supplies the transition forecast for February 1. Each
-origin predicts leads 1..48; the final origin intentionally extends into March.
-The model never retrains on February actuals. Updated eligible weather produces
-a fresh forecast with the same frozen model.
-
-- `artifacts/predictions/february_rolling_forecast.csv`: 29 origins × 2 turbines × 48 = **2,784 rows**.
-- `artifacts/predictions/february_submission.csv`: **2,686 rows** whose valid times fall in local February; forecast origins and overlapping leads are retained, not averaged or deduplicated.
-- `artifacts/diagnostics/february_forecast_qc.json`: all horizons, clocks, availability, finite/bounded predictions passed.
-- `artifacts/diagnostics/february_forecast_summaries.json`: deterministic 24h/48h means, peaks, lows, three-hour minimum blocks, hourly ramps, and turbine differences.
-
-No fake `y_true` column or February accuracy metric is provided. Immutable
-per-run forecast/provenance/summary copies remain under `artifacts/predictions/runs/`.
-
-## One orchestrator and safe tools
-
-```text
-context → archived weather → weather validation → features → frozen inference
-        → power validation → deterministic summary → persistence → optional analysis
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip check
+python -m streamlit run app.py
 ```
 
-`src/agent.py` is one executable, deterministic state machine, not a collection
-of pretend LLM agents. Typed tools in `src/forecasting.py` enforce every gate.
-The orchestrator may retry retrieval, choose an older eligible run, stop on
-invalid inputs, and recalculate; neither an LLM nor a prompt decides eligibility.
-
-Operational decisions:
-
-- Connection errors, HTTP 429, and 5xx: at most two retries with 1s/2s backoff per request.
-- Missing run (404/410 or an explicit run-unavailable 400): try at most two older six-hour initializations. Every run passes the same seven-hour cutoff. Never a newer unavailable run, observations, or another model.
-- Missing variables, wrong units, invalid provenance, or invalid predictions: fail, record the error, do not publish a forecast. No synthetic fills.
-- Recalculation: new `run_id`, preserve prior files, record previous run and whether weather response hashes changed.
-- LLM failure: retain the validated forecast and record an optional-analysis warning.
-
-Each `artifacts/agent_runs/<run_id>.json` records start/end times, context,
-tool order/status/timing, weather cache/retry/fallback decisions, selected
-initializations, model hashes/version, output path, warnings, errors, and
-recalculation lineage. Forecasts are not published before numerical validation.
-
-OpenAI is optional. `OPENAI_API_KEY` is read from the environment or ignored
-`.env`; it is never logged or saved. `OPENAI_MODEL` defaults to `gpt-4.1-mini`.
-The analysis layer uses the Responses API with
-[strict structured output](https://developers.openai.com/api/docs/guides/structured-outputs).
-The LLM selects salient IDs from supplied deterministic facts, and Python
-renders their sentences. This intentionally constrained MVP prevents invented
-numbers and causal claims. It has no forecast dataframe or execution authority.
-No key was available during the original Phase 4 run;
-success, invalid output, and failure paths are unit-tested with mocks, at no cost.
-
-### OpenAI audit metadata
-
-New `artifacts/agent_runs/<run_id>.json` files include a top-level `openai` object
-(also attached to the existing analysis result): response ID, returned model,
-requested model, execution/API response statuses, server `created_at` when
-provided, UTC request start/end, locally measured monotonic `latency_ms`, and
-token usage. Only `x-request-id` is read from response headers for the optional
-`openai_request_id`; full headers are not persisted. Field meanings follow the
-[Responses schema](https://developers.openai.com/api/reference/python/resources/responses/methods/retrieve)
-and [request-ID documentation](https://developers.openai.com/api/reference/overview#debugging-requests).
-
-Missing token counts are `null`, never estimated. Nested usage retains only
-allowlisted nonnegative aggregate counters (for example cached/reasoning tokens);
-unknown fields are ignored. Missing or malformed usage does not fail analysis.
-`called=true` means a request was attempted, not proof that a server received it
-after a network failure. Skips record `called=false` and a reason. Failures keep
-timings, any received IDs/usage, and a fixed safe error message, never raw provider
-errors or stack traces. `response_status` preserves the API status separately
-when local fact-selection validation fails. Uninstrumented legacy/custom adapters
-record `called=null`; old audit files are left unchanged.
-
-API keys are never persisted. Full LLM prompts, request bodies, authorization
-headers, cookies, and hidden instructions are not stored. Prompt audit records
-only analysis type, template version, and fact count; the existing run context
-already supplies turbine IDs, forecast origin, and run ID. Schema-validated LLM
-fact selection cannot change deterministic numerical forecasts, timestamps,
-weather runs, warnings, model identity, horizons, or QC.
-
-Audit-patch verification: 51 tests passed (12 additional mocked cases), compile
-checks passed. Exactly one live call was executed on 2026-09-23 after the tests:
-run `3e41a55d2a4d4b35a2cbac8db2371629`, HTTP 200, returned model
-`gpt-4.1-mini-2025-04-14`, status `completed`, latency 3609 ms, usage 760 input +
-29 output = 789 tokens. Response ID and request ID are recorded in that run's
-audit. The forecast CSV matched the earlier run in every column except the new
-`run_id`; no original audit files were rewritten. Tests use synthetic credentials
-only, and no API credits. Existing NumPy timedelta deprecation warnings remain
-outside this isolated audit patch.
-
-`replay-february` always disables network and LLM calls. It replays all 29 origins
-through the same orchestrator, saves new immutable run records and separate
-`february_replay_*` exports, and checks exact equality with canonical predictions.
-Executed result: **58 cache hits, zero network requests, identical predictions**.
-
-## Structure and artifacts
-
-```text
-src/
-  scada.py, gaps.py             SCADA quality and contiguous segments
-  weather.py, leakage.py        archived requests and deterministic time guards
-  features.py, training_data.py prediction features and exact target joins
-  models.py, development.py     curves, OOF, four-model walk-forward, frozen fit
-  archive_audit.py              hash/exact-value cache reconciliation
-  forecasting.py               typed deterministic operational tools
-  agent.py, analysis_layer.py   orchestration and optional grounded explanation
-  cli.py                       reproducible commands
-  dashboard.py                 Streamlit views and explicit action controls
-  dashboard_data.py            read-only, allowlisted artifact adapters
-  dashboard_runtime.py         local model-path adapter and agent delegation
-app.py                         dashboard entry point
-tests/                         unit tests, including mocked provider/OpenAI failures
-data/cache/weather/            ignored raw archived weather and metadata
-artifacts/
-  datasets/                    forecast_training.csv, origin OOF features
-  metrics/                     model_comparison.csv and .json
-  diagnostics/                 errors, temporal audits, acceptance, forecast QC
-  models/                      model_selection.json and versioned final models
-  predictions/                 walk-forward, February, replay, immutable runs
-  agent_runs/                  execution audit JSONs
-```
-
-The selection artifact is `artifacts/models/model_selection.json`.
-`artifacts/diagnostics/error_analysis.csv` and
-`artifacts/predictions/walk_forward_predictions.csv` retain the full comparison.
-
-## Reproduce
+### Windows PowerShell
 
 ```powershell
-python -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env
+python -m pip check
+python -m streamlit run app.py
+```
 
+Откройте адрес, напечатанный Streamlit, обычно **http://localhost:8501**. Остановка сервера — `Ctrl+C`. При отсутствии артефактов появится инструкция по их подготовке; это ожидаемое состояние новой копии проекта.
+
+### Настройки окружения
+
+Значения по умолчанию позволяют запустить интерфейс без `.env`. Для настройки скопируйте [.env.example](.env.example) в `.env`, если такого файла ещё нет. Не перезаписывайте существующие ключи. `.env` исключён из Git.
+
+| Переменная | Значение по умолчанию / назначение |
+|---|---|
+| `SCADA_TIMESTAMP_MODE` | `civil_time`; также поддерживается явный `fixed_offset` |
+| `SCADA_FIXED_UTC_OFFSET_HOURS` | Для режима `fixed_offset`; в примере — `5` |
+| `FORECAST_ORIGIN_CONVENTION` | `almaty_midnight` |
+| `WEATHER_AVAILABILITY_LAG_HOURS` | `7` |
+| `OPENAI_API_KEY` | Необязательный ключ для нового AI-анализа |
+| `OPENAI_MODEL` | `gpt-4.1-mini` |
+| `OPEN_METEO_API_KEY` | Зарезервирован в примере, текущим публичным погодным клиентом не используется |
+
+Изменение часовой политики или задержки требует повторной проверки методологии и моделей. Текущий код сохранения финального манифеста фиксирует `civil_time/Asia/Almaty` и задержку 7 часов; одной правки `.env` недостаточно для поддержки иной финальной конфигурации.
+
+### Если команда передала готовые результаты
+
+Скопируйте их с сохранением структуры:
+
+```text
+artifacts/
+  predictions/
+    february_rolling_forecast.csv
+    runs/<run_id>/
+      forecast.csv
+      summary.json
+      weather_provenance.json
+      analysis.json                 # если AI-анализ выполнялся
+  agent_runs/<run_id>.json
+  metrics/model_comparison.csv
+  models/
+    model_selection.json
+    final/
+      manifest.json
+      <model_version>/T1.joblib
+      <model_version>/T2.joblib
+data/cache/weather/                 # для нового расчёта без погодной сети
+```
+
+Для просмотра прогнозов нужны CSV; для истории агента и AI — соответствующие журналы и файлы конкретного запуска; для таблицы качества — метрики. Модели и погодный кеш нужны только для нового расчёта.
+
+Dashboard умеет находить перенесённые модели в `models/final/<model_version>/` и проверяет их хеши. CLI загружает пути из манифеста, которые могут быть абсолютными путями другого компьютера. Для CLI используйте модели, созданные локальным `freeze-models`; для перенесённых моделей используйте предусмотренный адаптер dashboard.
+
+## 7. Полное воспроизведение: от CSV до февральского прогноза
+
+Этот путь нужен, если готовых результатов нет. Он требует сети для загрузки погоды; модели обучаются локально. Время выполнения зависит от API и компьютера. Команды подготовки и сравнения перезаписывают сводные артефакты соответствующего этапа.
+
+### Шаг 1. Проверить окружение и исходные данные
+
+```bash
 python -m pytest -q
 python -m src.cli prepare
 python -m src.cli smoke
+```
+
+`prepare` показывает полные, частичные и пустые часы. `smoke` проверяет по две турбины на трёх датах. В этой диагностической команде origins заданы в **00:00 UTC**, тогда как основной цикл использует **00:00 Алматы**.
+
+### Шаг 2. Подготовить историческую погоду и обучающий датасет
+
+```bash
 python -m src.cli phase2a-build
+```
+
+Диапазон по умолчанию: 1 октября 2025 — 29 января 2026, 121 origin. При полном успешном получении данных это **11 616 строк = 121 × 2 × 48**. Это ожидаемый размер по конфигурации, а не гарантия успешной загрузки API.
+
+**Совместимость форматов:** `phase2a-build` предпочитает Parquet, если установлен движок; `phase2b-backtest` и сверка архива читают `forecast_training.csv`. После успешной сборки выполните конвертацию свежего Parquet, если он создан:
+
+```bash
+python -c "from pathlib import Path; import pandas as pd; p = Path('artifacts/datasets/forecast_training.parquet'); pd.read_parquet(p).to_csv(p.with_suffix('.csv'), index=False) if p.is_file() else None"
 python -m src.archive_audit
+```
+
+Сверка сравнивает значения и временные метаданные обучающей погоды с кешем и проверяет хеши. Она не загружает замену отсутствующему кешу.
+
+### Шаг 3. Сравнить модели
+
+```bash
 python -m src.cli phase2b-backtest
-
-# Review the held-out metrics/errors before passing the acceptance gate.
-# This command re-runs tests and reconciles every training forecast with cache.
-python -m src.cli accept-validation --review "A has lowest pooled MAE and is simplest; B has lower bias. Keep high-generation underprediction as an explicit limitation."
-python -m src.cli freeze-models
-python -m src.cli february-forecast
-python -m src.cli agent-forecast --origin "2026-02-10 00:00" --turbines T1,T2 --no-llm --cache-only
-python -m src.cli agent-forecast --origin "2026-02-10 00:00" --cache-only
-python -m src.cli replay-february
-python -m compileall -q src tests
 ```
 
-Do not overwrite an existing `.env` with the example. The second agent command
-uses OpenAI only if a key is configured; `--cache-only` applies to weather, not
-OpenAI. Use `--no-llm` to guarantee no OpenAI call. A naive CLI origin explicitly
-means Asia/Almaty local time, while an offset-aware input is converted to UTC.
+По умолчанию используются **60 ежедневных origins** с 1 декабря 2025 по 29 января 2026. На каждом origin каждая стратегия обучается заново на доступной к тому моменту истории, отдельно для T1 и T2:
 
-`phase2b-backtest --start-date 2025-12-15 --end-date 2025-12-15` is supported for
-a small experiment, but **overwrites comparison artifacts and does not satisfy
-the two-month gate**. Re-run the complete default comparison before selecting
-or freezing models. The same applies to a January-only sample. The executed
-60-origin run already includes both December and January samples.
-
-Phase 5 adds only Streamlit and Plotly to the existing direct requirements
-(pandas, numpy, requests, sklearn, CatBoost, joblib, pytest, and python-dotenv).
-Exact fitted-package versions are saved with the model.
-`data/cache/`, `artifacts/`, `.env`, and Python caches remain ignored; original
-SCADA CSVs were not changed.
-
-Environment settings are in `.env.example`: `SCADA_TIMESTAMP_MODE`,
-`SCADA_FIXED_UTC_OFFSET_HOURS`, `FORECAST_ORIGIN_CONVENTION`,
-`WEATHER_AVAILABILITY_LAG_HOURS`, `OPENAI_API_KEY`, and `OPENAI_MODEL`.
-`OPEN_METEO_API_KEY` is an unused placeholder: this client uses the public
-non-commercial Single Runs endpoint and does not attach that key. Changing
-timezone or availability policy requires new validation/model artifacts;
-the orchestrator rejects a weather lag differing from the frozen manifest.
-
-## Executed verification and limitations
-
-39 tests passed, 0 failed; compile checks passed. Full December/January
-walk-forward, archive reconciliation (242 cached requests/11,616 exact weather
-matches), six weather smoke cases, model freezing, February generation, no-LLM
-demo, no-key demo, and complete cache-only replay were executed successfully.
-Synthetic data is used only in isolated unit fixtures, never in saved operational
-or validation artifacts. Fallback and network-failure branches were mocked;
-the real February runs required no fallback.
-
-Unresolved assumptions: organizer timestamp convention and actual hub height;
-seven-hour publication lag; negligible SCADA ingestion latency after each
-hour finishes; grid-to-turbine spatial/height mismatch. Validation covers only
-two winter months and the scored pairs overlap. January origins stop at the
-29th. There is no uncertainty calibration or February ground-truth evaluation.
-The final curve's high-output underprediction is material, not hidden by the
-overall score. B is a reasonable future challenger if bias/RMSE matter more
-than MAE; changing that objective requires a new documented pre-February review.
-
-Before an LLM demo, configure a key and run one optional explanation explicitly.
-Before a submission, confirm the organizer's required rolling-origin export
-format. Future improvements: confirm clock/hub specifications, extend archived
-training seasons, add chronological uncertainty calibration and an explicit
-asymmetric operational loss. The dashboard presents these limitations alongside
-the immutable forecasts.
-
-## Dashboard — WindAgent AI
-
-From the repository root, with your Python environment activated:
-
-```powershell
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Open the local URL printed by Streamlit (normally `http://localhost:8501`).
-Alternatively, use `python -m streamlit run app.py` if the `streamlit` executable
-is not on PATH. On Windows, activate the local environment with
-`.\.venv\Scripts\Activate.ps1` first. No Node service, database, or container is
-required.
-
-The default **Cached Replay** mode is offline. Select **February 10**, **Both**,
-inspect the 48-hour power and weather charts, then open **Agent Execution & AI**.
-Return to the provenance panel to explain the availability cutoff. Use
-**Previous / Next Origin** to show the daily cycle. The sidebar has a two-minute
-demo guide. Only valid historical simulation origins are offered; January 31
-is the transition forecast and February 28 extends into March.
-
-The four tabs are:
-
-- **Generation & weather:** turbine KPI cards, exact saved hourly predictions,
-  deterministic backend insights, separate wind/temperature scales, and
-  point-in-time provenance. Power is normalized from 0 to 1, not MW or MWh.
-- **Agent Execution & AI:** recorded tool order, timing, failures, cache use,
-  recalculation lineage, saved explanation, model, latency, and token usage.
-- **February Replay:** all 29 origins, artifact availability, latest agent
-  status, completed/failed attempts, and saved analysis counts.
-- **System & validation:** architecture, temporal guard, coordinates,
-  assumptions, and the saved December/January model comparison.
-
-### Artifacts for a copied checkout
-
-Generated artifacts remain ignored by Git. Copy the existing Phase 4 outputs
-into the same **repository-relative** locations before the demo. The dashboard
-has no dependency on the original developer's Windows path.
-
-| Artifact | Purpose |
+| Код | Стратегия |
 |---|---|
-| `artifacts/predictions/february_rolling_forecast.csv` | Primary replay forecast, weather inputs, and timestamps |
-| `artifacts/predictions/runs/<run_id>/forecast.csv` | Exact per-run forecast, including later agent recalculations |
-| `artifacts/predictions/runs/<run_id>/analysis.json` | Optional persisted AI result for that run |
-| `artifacts/agent_runs/<run_id>.json` | Actual execution trace and OpenAI metadata |
-| `artifacts/metrics/model_comparison.csv` | Held-out December/January comparison and horizon metrics |
-| `artifacts/models/model_selection.json` | Which model was selected; no winner is inferred if absent |
-| `artifacts/models/final/manifest.json` and `<version>/T1.joblib`, `T2.joblib` | Required only for an explicit new agent run |
-| `data/cache/weather/` | Required only for an explicit cache-only agent run |
+| `A_direct_curve` | Прогнозный ветер ECMWF на 100 м → эмпирическая кривая мощности |
+| `B_calibrated_curve` | Погода → HistGradientBoosting для калибровки ветра → кривая мощности |
+| `C_hist_gradient` | Погодные и календарные признаки → HistGradientBoosting для мощности |
+| `D_hybrid_catboost` | Погодные признаки и OOF-прогноз кривой → CatBoost |
 
-Keep per-run `summary.json` and `weather_provenance.json` with the copied run
-directories for reproducibility. The dashboard uses the existing backend
-summarizer on validated persisted predictions for insights. It does not need
-model binaries, weather response caches, SCADA, or an API key merely to view
-saved forecasts and analysis. `february_submission.csv`, comparison JSON, and
-diagnostic/QC files can be retained but are not required by the dashboard.
+Основной критерий — MAE на полных наблюдаемых часах. При разнице до 0.002 предпочтение отдаётся более простой стратегии. Сохраняются также RMSE, R², смещение, ошибки по горизонтам и отдельное сравнение полностью наблюдаемых 48-часовых окон. Соседние прогнозы перекрываются; пары origin/target не являются независимыми наблюдениями.
 
-A saved run selector ties forecasts to audits by **run ID, origin, turbine
-coverage, model version, and recorded weather provenance**, never by date alone.
-It prefers an available successful run with saved AI analysis; all recorded
-attempts, including failures, remain selectable. A mismatch does not acquire a
-success badge or someone else's explanation. Missing audits display
-“No saved agent run for this origin and forecast run ID.”
+Изучите:
 
-Missing or malformed artifacts produce a friendly message and a reproduction
-command, while the architecture and other available sections stay accessible.
-There are no bundled fabricated demo predictions or hardcoded validation scores.
+- `artifacts/metrics/model_comparison.csv`;
+- `artifacts/diagnostics/error_analysis.csv`;
+- `artifacts/diagnostics/outer_fold_audit.csv`;
+- `artifacts/models/model_selection.json`.
 
-### Generate or recalculate
+Короткий эксперимент допускается через `--start-date` и `--end-date`, но он перезаписывает артефакты сравнения. Одномесячный запуск не проходит проверку наличия обоих месяцев. Для итоговой поставки используйте полный диапазон по умолчанию.
 
-If the frozen models and earlier validated inputs already exist:
+### Шаг 4. Зафиксировать проверку и сохранить модели
 
-```powershell
+После изучения результатов замените текст аргумента `--review` своим выводом о качестве и ограничениях:
+
+```bash
+python -m src.cli accept-validation --review "Ваш вывод по фактическим метрикам, ошибкам и ограничениям выбранной стратегии"
+python -m src.cli freeze-models
+```
+
+`accept-validation` повторно запускает тесты, сверяет архив и проверяет временные границы, диапазон мощности, OOF и одинаковые выборки сравнения. `freeze-models` требует успешного прохождения этого этапа и неизменившегося датасета. Модели, версии пакетов, хеши и cutoff сохраняются в `artifacts/models/final/`.
+
+### Шаг 5. Сформировать прогноз и журналы агента
+
+```bash
 python -m src.cli february-forecast
 python -m src.cli agent-forecast --origin "2026-02-10 00:00" --turbines T1,T2 --cache-only --no-llm
 python -m src.cli replay-february
+python -m streamlit run app.py
 ```
 
-If starting only with the source/SCADA files, first follow the full **Reproduce**
-workflow above: archived-weather dataset, complete December/January backtest,
-acceptance review, and model freeze. `february-forecast` alone cannot create
-those prerequisites. It may retrieve missing archived weather. The complete
-replay command requires all weather cached and checks exact equality with the
-canonical predictions. To rebuild missing validation metrics, use
-`python -m src.cli phase2b-backtest`; this is a potentially lengthy setup step
-that overwrites comparison artifacts, never an automatic dashboard action.
+`february-forecast` рассчитывает 29 origins с 31 января по 28 февраля, по 48 часов для двух турбин: при успехе **2 784 строки**. Последние горизонты выходят в март. Отдельный submission содержит только targets локального февраля; пересечения горизонтов сохраняются.
 
-In the UI, **Run Agent Forecast → Run agent forecast** delegates to the existing
-`ForecastOrchestrator`, always for both turbines, with cache-only weather and
-OpenAI disabled. It preserves earlier runs and saves a new audit. A missing
-cache or invalid input fails rather than inventing weather. Chart turbine
-selection only filters the presentation.
+`agent-forecast` создаёт отдельный запуск и журнал. `replay-february` повторяет весь период через оркестратор **без сетевых запросов и LLM**, сохраняет отдельные результаты и проверяет точное совпадение мощности с каноническим февральским прогнозом. Нужны полный погодный кеш, локальные модели и исходный февральский экспорт.
 
-Copied frozen manifests may contain absolute file paths from the original
-machine. The dashboard's thin read-only adapter resolves the standard
-`models/final/<model_version>/<turbine>.joblib` layout inside this checkout and
-verifies every recorded SHA-256 before loading. Only the in-memory paths passed
-to the existing agent are localized; stored manifests, hashes, models, and
-forecast methodology are unchanged. The existing CLI retains its own manifest
-path behavior.
+### Опциональный новый AI-анализ
 
-### Optional AI analysis and security
+При заданном `OPENAI_API_KEY`:
 
-Persisted analysis is displayed **without an API key**. A missing key disables
-the new-analysis button; forecasts, provenance, replay, and metrics still work.
-For a new explanation, configure the existing backend environment and explicitly
-click **Generate an explanation explicitly → Run AI analysis**, or run:
-
-```powershell
-python -m src.cli agent-forecast --origin "2026-02-10 00:00" --cache-only
+```bash
+python -m src.cli agent-forecast --origin "2026-02-10 00:00" --turbines T1,T2 --cache-only
 ```
 
-The UI button runs the existing agent again, then calls its optional analysis
-step and saves a **new run**. This preserves the existing audit lifecycle instead
-of rewriting an old audit or attaching a new explanation to a different run.
-Weather remains cache-only; OpenAI requires internet and may incur usage charges.
-No AI or weather request occurs on page load, refresh, or widget changes.
-**AI explanation does not modify numerical forecasts.**
+`--cache-only` запрещает сеть только для погоды; OpenAI требует интернет и расходует API-кредиты. Чтобы гарантированно исключить AI-вызов, добавьте `--no-llm`. Для чтения уже сохранённого объяснения ключ не нужен. Журнал содержит статус, доступные идентификаторы ответа, задержку и расход токенов; отсутствующие сведения не оцениваются искусственно.
 
-Only allowlisted audit fields reach the UI. Explanations are rendered from the
-saved selected fact IDs using the existing deterministic fact renderer; arbitrary
-legacy free-form text is withheld. API keys, `.env`, full prompts, request bodies,
-headers, provider error bodies, and hidden instructions are never displayed.
-Missing latency/token metadata is shown as not recorded, not estimated. Static
-HTML contains only fixed/escaped labels. Streamlit data caches contain sanitized
-artifacts, never secrets; file timestamp/size fingerprints invalidate changed
-artifacts, and the sidebar offers an explicit refresh.
+## 8. Как жюри проверить решение
 
-This is a local hackathon dashboard, not a hosted multi-user service. Run it on
-the trusted demo machine. The theme disables Streamlit usage telemetry and
-keeps application error details out of the browser.
+### Базовая проверка новой копии
 
-### Dashboard verification
+1. Установить зависимости по разделу 6.
+2. Выполнить `python -m pytest -q` и `python -m src.cli prepare`.
+3. Запустить `python -m streamlit run app.py`.
+4. Убедиться, что интерфейс открывается; при отсутствии прогнозов отображается сообщение об отсутствующих артефактах, а не фиктивные графики.
 
-```powershell
-python -m pytest -q
-python -m compileall -q src tests
-streamlit run app.py
+**Подтверждённая локальная проверка 23.09.2026:** Python 3.12.2, **71 тест пройден**, `pip check` не обнаружил конфликтов зависимостей. Есть предупреждения NumPy о будущих изменениях обработки timedelta. Тесты покрывают временные нарушения, OOF, обработку ошибок API, корректность моделей, перенос моделей, чтение артефактов и поведение интерфейса через AppTest. Внешние ответы в тестах заменяются изолированными fixtures; это не доказательство качества реального февральского прогноза.
+
+### Демо с реальными результатами
+
+Предварительно получить комплект артефактов команды либо выполнить раздел 7.
+
+1. В dashboard выбрать `2026-02-10 00:00` по Алматы и обе турбины.
+2. Проверить 48-часовые графики, среднюю мощность на 24/48 часов и время пика. Переключить T1/T2.
+3. Проверить происхождение погоды: инициализацию ECMWF, origin и предполагаемую доступность до origin.
+4. Открыть **Agent Execution & AI** и сопоставить шаги с конкретным `run_id`. При отсутствии сохранённого AI-анализа приложение должно сообщить об этом.
+5. Открыть **System & validation** и посмотреть сохранённое сравнение четырёх моделей. Убедиться, что это метрики backtest, а не обучения.
+6. При наличии моделей и кеша выполнить **Run Agent Forecast → Run agent forecast**. Появится новый запуск; прежний останется в истории.
+7. Для строгой проверки повторяемости выполнить `python -m src.cli replay-february`: команда должна подтвердить совпадение с каноническими прогнозами и отсутствие погодных сетевых запросов.
+
+### Где проверять результат
+
+| Артефакт | Содержание |
+|---|---|
+| `artifacts/predictions/february_rolling_forecast.csv` | Полные 48-часовые прогнозы, погодные признаки и происхождение |
+| `artifacts/predictions/february_submission.csv` | Сокращённая таблица только с февральскими targets |
+| `artifacts/predictions/runs/<run_id>/` | Прогноз, сводка, погодные метаданные и опциональный AI-анализ конкретного запуска |
+| `artifacts/agent_runs/<run_id>.json` | Выполненные инструменты, статусы, предупреждения, ошибки и метаданные OpenAI |
+| `artifacts/diagnostics/february_forecast_qc.json` | Контроль горизонтов, дат и диапазона мощности |
+| `artifacts/diagnostics/february_replay_forecast_qc.json` | Результат повторного выполнения без сети |
+
+Ключевые поля полного прогноза:
+
+| Поле | Значение |
+|---|---|
+| `forecast_origin_utc`, `forecast_origin_local` | Момент выпуска в UTC и по Алматы |
+| `valid_time_utc`, `valid_time_local` | Время target |
+| `lead_time_hours` | Горизонт 1–48 часов |
+| `turbine_id` | `T1` или `T2` |
+| `predicted_power` | Прогноз в диапазоне [0, 1] |
+| `weather_provider`, `weather_model` | Источник и погодная модель |
+| `weather_run_init_utc`, `weather_available_at_utc` | Инициализация и предполагаемая доступность погоды |
+| `model_name`, `model_version`, `run_id` | Стратегия, версия и идентификатор запуска |
+
+Сокращённый submission содержит `turbine_id`, `forecast_origin_utc`, `valid_time_utc`, `lead_time_hours`, `predicted_power`, `model_name`, `run_id`. Для полного происхождения данных нужен rolling CSV. Операционные прогнозы не содержат вымышленных фактических `y_true`.
+
+## 9. Подтверждённые результаты и комплектность
+
+В проверенной локальной копии есть исходные CSV, код, тесты и результаты более ранней небольшой проверки: датасет на 17 origins / 1 632 строки и трёхдневный backtest. Эти локальные файлы игнорируются Git и **не заменяют полный цикл сравнения четырёх стратегий**.
+
+На момент подготовки README в этой копии отсутствуют финальные модели, `artifacts/metrics/model_comparison.csv`, февральский экспорт и журналы агента. Поэтому здесь не приводятся неподтверждённые итоговые MAE/RMSE/R², победитель полного сравнения или утверждение об успешном полном февральском запуске. Их источником должны служить артефакты выполнения, перечисленные выше. Dashboard также читает метрики из файлов, а не из текста документации.
+
+## 10. Ограничения текущей версии
+
+- **Погодная доступность — допущение.** Задержка семь часов не подтверждает фактическую публикацию каждого исторического запуска. Запись времени и хеша обеспечивает проверяемость расчёта, но не доказывает доступность прогноза в прошлом сама по себе.
+- **Не подтверждены часы SCADA и высота ступицы.** Сдвиг времени и различие между сеточной погодой ECMWF и измерениями у турбины влияют на качество.
+- **Исторический сценарий ограничен конфигурацией.** Основной backtest рассчитан на декабрь 2025 — январь 2026, replay — на февраль 2026. Это не постоянно работающая интеграция с действующей SCADA и текущими прогнозами.
+- **Нет оценки неопределённости и февральской точности в интерфейсе.** Доверительные интервалы не калибруются; inference не сравнивается с февральскими фактическими labels.
+- **Нет планировщика.** Оркестратор выполняется по CLI или кнопке; фоновый сервис автоматического выпуска новых прогнозов не реализован.
+- **Форматы требуют внимания.** После записи Parquet нужен CSV для обучения; компактный submission сохраняет перекрывающиеся прогнозы. Формат сдачи следует сверить с заданием организаторов.
+- **Воспроизводимость зависит от артефактов.** Модели и кеш нужно передать отдельно или пересоздать. Требования пакетов заданы диапазонами, общего lock-файла нет; версии fitted-пакетов сохраняются с моделью.
+- **CLI и перенос моделей.** CLI использует пути из сохранённого манифеста; dashboard имеет отдельный адаптер для перенесённых моделей.
+- **Некоторые предупреждения сводки заданы статически.** В коде есть предупреждения о занижении высокой мощности и росте ошибки на дальнем горизонте. При новом выборе модели их нужно сверять с фактической валидацией, а не считать независимым доказательством качества.
+- **Локальное приложение для демонстрации.** Авторизация пользователей, промышленное многопользовательское развёртывание, расчёт МВт·ч и финансовая оптимизация не реализованы.
+
+## 11. Развёрнутая версия
+
+**Публичная deployed-версия в репозитории не указана.** Подтверждённый способ запуска — локальный Streamlit:
+
+```bash
+python -m streamlit run app.py
 ```
 
-Focused adapter and Streamlit integration tests exercise missing/corrupt
-artifacts, exact numerical preservation, model comparison loading, audit
-matching, secret filtering, local model relocation/hash verification, chart
-traces, turbine/date changes, and offline rerenders. Synthetic fixtures are
-created only in test temporary directories; they are never production artifacts.
-The original forecasting modules are unchanged. Real-data visual verification
-requires copying the existing Phase 4 artifacts into this fresh checkout.
-
-Phase 5 verification in this checkout: **71 tests passed, 0 failed** (the 51
-existing tests plus 20 adapter/integration cases); `compileall` and
-`git diff --check` passed. The 200 existing NumPy timedelta deprecation warnings
-remain. A running Streamlit server returned a healthy response, and an automated
-Edge browser check verified the real checkout's missing-artifact screen. Isolated
-temporary fixtures verified exact chart values, both turbine traces, weather,
-provenance, audit steps, saved analysis, model metrics, and origin switching with
-zero browser errors. Desktop/mobile screenshots were visually reviewed.
-No real ECMWF retrieval or OpenAI call was made for these checks. Production
-February values and the original saved OpenAI run were unavailable here and
-still need a final demo check after their artifacts are copied. Browser tooling
-and screenshots were kept in the ignored local test environment, not added to
-the application dependencies or production artifact tree.
-
-Implementation references: [Streamlit data caching](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.cache_data),
-[Streamlit AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest),
-and [Plotly date axes](https://plotly.com/python/time-series/).
+Адрес `http://localhost:8501` относится к компьютеру, на котором запущен сервер, и не является публичной ссылкой на проект.
