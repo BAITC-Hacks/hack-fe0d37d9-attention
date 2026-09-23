@@ -3,7 +3,8 @@
 Hourly 24-48 hour normalized-power forecasting for two wind turbines. Phases
 2B-4 are implemented and executed: pre-February walk-forward comparison,
 frozen-model February inference, and an auditable tool orchestrator with
-optional OpenAI analysis. No dashboard or decorative multi-agent framework.
+optional OpenAI analysis. Phase 5 adds a Streamlit presentation layer over the
+existing deterministic tools and persisted artifacts.
 
 ## Data, locations, and SCADA time
 
@@ -295,6 +296,10 @@ src/
   forecasting.py               typed deterministic operational tools
   agent.py, analysis_layer.py   orchestration and optional grounded explanation
   cli.py                       reproducible commands
+  dashboard.py                 Streamlit views and explicit action controls
+  dashboard_data.py            read-only, allowlisted artifact adapters
+  dashboard_runtime.py         local model-path adapter and agent delegation
+app.py                         dashboard entry point
 tests/                         unit tests, including mocked provider/OpenAI failures
 data/cache/weather/            ignored raw archived weather and metadata
 artifacts/
@@ -347,9 +352,9 @@ the two-month gate**. Re-run the complete default comparison before selecting
 or freezing models. The same applies to a January-only sample. The executed
 60-origin run already includes both December and January samples.
 
-No new mandatory dependency or dashboard framework was added. The existing
-requirements include pandas, numpy, requests, sklearn, CatBoost, joblib, pytest,
-and python-dotenv. Exact fitted-package versions are saved with the model.
+Phase 5 adds only Streamlit and Plotly to the existing direct requirements
+(pandas, numpy, requests, sklearn, CatBoost, joblib, pytest, and python-dotenv).
+Exact fitted-package versions are saved with the model.
 `data/cache/`, `artifacts/`, `.env`, and Python caches remain ignored; original
 SCADA CSVs were not changed.
 
@@ -384,4 +389,172 @@ Before an LLM demo, configure a key and run one optional explanation explicitly.
 Before a submission, confirm the organizer's required rolling-origin export
 format. Future improvements: confirm clock/hub specifications, extend archived
 training seasons, add chronological uncertainty calibration and an explicit
-asymmetric operational loss, then build a dashboard over these immutable outputs.
+asymmetric operational loss. The dashboard presents these limitations alongside
+the immutable forecasts.
+
+## Dashboard — WindAgent AI
+
+From the repository root, with your Python environment activated:
+
+```powershell
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Open the local URL printed by Streamlit (normally `http://localhost:8501`).
+Alternatively, use `python -m streamlit run app.py` if the `streamlit` executable
+is not on PATH. On Windows, activate the local environment with
+`.\.venv\Scripts\Activate.ps1` first. No Node service, database, or container is
+required.
+
+The default **Cached Replay** mode is offline. Select **February 10**, **Both**,
+inspect the 48-hour power and weather charts, then open **Agent Execution & AI**.
+Return to the provenance panel to explain the availability cutoff. Use
+**Previous / Next Origin** to show the daily cycle. The sidebar has a two-minute
+demo guide. Only valid historical simulation origins are offered; January 31
+is the transition forecast and February 28 extends into March.
+
+The four tabs are:
+
+- **Generation & weather:** turbine KPI cards, exact saved hourly predictions,
+  deterministic backend insights, separate wind/temperature scales, and
+  point-in-time provenance. Power is normalized from 0 to 1, not MW or MWh.
+- **Agent Execution & AI:** recorded tool order, timing, failures, cache use,
+  recalculation lineage, saved explanation, model, latency, and token usage.
+- **February Replay:** all 29 origins, artifact availability, latest agent
+  status, completed/failed attempts, and saved analysis counts.
+- **System & validation:** architecture, temporal guard, coordinates,
+  assumptions, and the saved December/January model comparison.
+
+### Artifacts for a copied checkout
+
+Generated artifacts remain ignored by Git. Copy the existing Phase 4 outputs
+into the same **repository-relative** locations before the demo. The dashboard
+has no dependency on the original developer's Windows path.
+
+| Artifact | Purpose |
+|---|---|
+| `artifacts/predictions/february_rolling_forecast.csv` | Primary replay forecast, weather inputs, and timestamps |
+| `artifacts/predictions/runs/<run_id>/forecast.csv` | Exact per-run forecast, including later agent recalculations |
+| `artifacts/predictions/runs/<run_id>/analysis.json` | Optional persisted AI result for that run |
+| `artifacts/agent_runs/<run_id>.json` | Actual execution trace and OpenAI metadata |
+| `artifacts/metrics/model_comparison.csv` | Held-out December/January comparison and horizon metrics |
+| `artifacts/models/model_selection.json` | Which model was selected; no winner is inferred if absent |
+| `artifacts/models/final/manifest.json` and `<version>/T1.joblib`, `T2.joblib` | Required only for an explicit new agent run |
+| `data/cache/weather/` | Required only for an explicit cache-only agent run |
+
+Keep per-run `summary.json` and `weather_provenance.json` with the copied run
+directories for reproducibility. The dashboard uses the existing backend
+summarizer on validated persisted predictions for insights. It does not need
+model binaries, weather response caches, SCADA, or an API key merely to view
+saved forecasts and analysis. `february_submission.csv`, comparison JSON, and
+diagnostic/QC files can be retained but are not required by the dashboard.
+
+A saved run selector ties forecasts to audits by **run ID, origin, turbine
+coverage, model version, and recorded weather provenance**, never by date alone.
+It prefers an available successful run with saved AI analysis; all recorded
+attempts, including failures, remain selectable. A mismatch does not acquire a
+success badge or someone else's explanation. Missing audits display
+“No saved agent run for this origin and forecast run ID.”
+
+Missing or malformed artifacts produce a friendly message and a reproduction
+command, while the architecture and other available sections stay accessible.
+There are no bundled fabricated demo predictions or hardcoded validation scores.
+
+### Generate or recalculate
+
+If the frozen models and earlier validated inputs already exist:
+
+```powershell
+python -m src.cli february-forecast
+python -m src.cli agent-forecast --origin "2026-02-10 00:00" --turbines T1,T2 --cache-only --no-llm
+python -m src.cli replay-february
+```
+
+If starting only with the source/SCADA files, first follow the full **Reproduce**
+workflow above: archived-weather dataset, complete December/January backtest,
+acceptance review, and model freeze. `february-forecast` alone cannot create
+those prerequisites. It may retrieve missing archived weather. The complete
+replay command requires all weather cached and checks exact equality with the
+canonical predictions. To rebuild missing validation metrics, use
+`python -m src.cli phase2b-backtest`; this is a potentially lengthy setup step
+that overwrites comparison artifacts, never an automatic dashboard action.
+
+In the UI, **Run Agent Forecast → Run agent forecast** delegates to the existing
+`ForecastOrchestrator`, always for both turbines, with cache-only weather and
+OpenAI disabled. It preserves earlier runs and saves a new audit. A missing
+cache or invalid input fails rather than inventing weather. Chart turbine
+selection only filters the presentation.
+
+Copied frozen manifests may contain absolute file paths from the original
+machine. The dashboard's thin read-only adapter resolves the standard
+`models/final/<model_version>/<turbine>.joblib` layout inside this checkout and
+verifies every recorded SHA-256 before loading. Only the in-memory paths passed
+to the existing agent are localized; stored manifests, hashes, models, and
+forecast methodology are unchanged. The existing CLI retains its own manifest
+path behavior.
+
+### Optional AI analysis and security
+
+Persisted analysis is displayed **without an API key**. A missing key disables
+the new-analysis button; forecasts, provenance, replay, and metrics still work.
+For a new explanation, configure the existing backend environment and explicitly
+click **Generate an explanation explicitly → Run AI analysis**, or run:
+
+```powershell
+python -m src.cli agent-forecast --origin "2026-02-10 00:00" --cache-only
+```
+
+The UI button runs the existing agent again, then calls its optional analysis
+step and saves a **new run**. This preserves the existing audit lifecycle instead
+of rewriting an old audit or attaching a new explanation to a different run.
+Weather remains cache-only; OpenAI requires internet and may incur usage charges.
+No AI or weather request occurs on page load, refresh, or widget changes.
+**AI explanation does not modify numerical forecasts.**
+
+Only allowlisted audit fields reach the UI. Explanations are rendered from the
+saved selected fact IDs using the existing deterministic fact renderer; arbitrary
+legacy free-form text is withheld. API keys, `.env`, full prompts, request bodies,
+headers, provider error bodies, and hidden instructions are never displayed.
+Missing latency/token metadata is shown as not recorded, not estimated. Static
+HTML contains only fixed/escaped labels. Streamlit data caches contain sanitized
+artifacts, never secrets; file timestamp/size fingerprints invalidate changed
+artifacts, and the sidebar offers an explicit refresh.
+
+This is a local hackathon dashboard, not a hosted multi-user service. Run it on
+the trusted demo machine. The theme disables Streamlit usage telemetry and
+keeps application error details out of the browser.
+
+### Dashboard verification
+
+```powershell
+python -m pytest -q
+python -m compileall -q src tests
+streamlit run app.py
+```
+
+Focused adapter and Streamlit integration tests exercise missing/corrupt
+artifacts, exact numerical preservation, model comparison loading, audit
+matching, secret filtering, local model relocation/hash verification, chart
+traces, turbine/date changes, and offline rerenders. Synthetic fixtures are
+created only in test temporary directories; they are never production artifacts.
+The original forecasting modules are unchanged. Real-data visual verification
+requires copying the existing Phase 4 artifacts into this fresh checkout.
+
+Phase 5 verification in this checkout: **71 tests passed, 0 failed** (the 51
+existing tests plus 20 adapter/integration cases); `compileall` and
+`git diff --check` passed. The 200 existing NumPy timedelta deprecation warnings
+remain. A running Streamlit server returned a healthy response, and an automated
+Edge browser check verified the real checkout's missing-artifact screen. Isolated
+temporary fixtures verified exact chart values, both turbine traces, weather,
+provenance, audit steps, saved analysis, model metrics, and origin switching with
+zero browser errors. Desktop/mobile screenshots were visually reviewed.
+No real ECMWF retrieval or OpenAI call was made for these checks. Production
+February values and the original saved OpenAI run were unavailable here and
+still need a final demo check after their artifacts are copied. Browser tooling
+and screenshots were kept in the ignored local test environment, not added to
+the application dependencies or production artifact tree.
+
+Implementation references: [Streamlit data caching](https://docs.streamlit.io/develop/api-reference/caching-and-state/st.cache_data),
+[Streamlit AppTest](https://docs.streamlit.io/develop/api-reference/app-testing/st.testing.v1.apptest),
+and [Plotly date axes](https://plotly.com/python/time-series/).

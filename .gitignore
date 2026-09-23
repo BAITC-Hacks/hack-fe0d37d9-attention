@@ -6,3 +6,7 @@
 .coverage
 data/cache/
 artifacts/
+.streamlit/secrets.toml
+.streamlit/logs/
+playwright-report/
+test-results/
