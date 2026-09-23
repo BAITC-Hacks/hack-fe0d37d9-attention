@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 
 from .config import DATA_CACHE_DIR, DEFAULT_AVAILABILITY_LAG_HOURS
+from .leakage import validate_weather_samples
 
 
 SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
@@ -27,6 +28,16 @@ REQUESTED_VARIABLES = (
     "temperature_2m",
     "surface_pressure",
 )
+EXPECTED_HOURLY_UNITS = {
+    "time": "unixtime",
+    "wind_speed_10m": "m/s",
+    "wind_speed_80m": "m/s",
+    "wind_speed_100m": "m/s",
+    "wind_speed_120m": "m/s",
+    "wind_direction_100m": "\u00b0",
+    "temperature_2m": "\u00b0C",
+    "surface_pressure": "hPa",
+}
 
 
 class WeatherArchiveError(RuntimeError):
@@ -63,8 +74,9 @@ def select_latest_available_run(
 
 @dataclass(frozen=True)
 class WeatherMetadata:
-    forecast_origin: str
-    selected_run: str
+    forecast_origin_utc: str
+    weather_run_init_utc: str
+    weather_available_at_utc: str
     availability_cutoff: str
     availability_lag_hours: int
     model: str
@@ -76,12 +88,14 @@ class WeatherMetadata:
     raw_response_sha256: str
     request_parameters: dict[str, Any]
     cache_key: str
+    fallback_steps: int
 
 
 @dataclass
 class WeatherForecast:
     data: pd.DataFrame
     metadata: WeatherMetadata
+    cache_hit: bool
 
 
 class OpenMeteoSingleRunsClient:
@@ -121,7 +135,9 @@ class OpenMeteoSingleRunsClient:
             "longitude": round(float(longitude), 6),
             "models": MODEL,
             "run": selected_run.strftime("%Y-%m-%dT%H:%M"),
-            "timezone": "GMT",
+            "timezone": "UTC",
+            "timeformat": "unixtime",
+            "wind_speed_unit": "ms",
             "hourly": ",".join(REQUESTED_VARIABLES),
             "forecast_hours": elapsed_hours + horizon_hours + 1,
         }
@@ -191,15 +207,33 @@ class OpenMeteoSingleRunsClient:
             raise WeatherArchiveError(
                 f"Archived forecast omitted requested variables: {sorted(missing)}"
             )
-        frame = frame.rename(columns={"time": "target_timestamp"})
-        frame["target_timestamp"] = pd.to_datetime(
-            frame["target_timestamp"], errors="raise", utc=True
-        )
+        units = payload.get("hourly_units")
+        if not isinstance(units, dict):
+            raise WeatherArchiveError("Open-Meteo response lacks hourly unit metadata")
+        wrong_units = {
+            name: {"expected": expected, "received": units.get(name)}
+            for name, expected in EXPECTED_HOURLY_UNITS.items()
+            if units.get(name) != expected
+        }
+        if wrong_units:
+            raise WeatherArchiveError(
+                f"Open-Meteo response units do not match the persisted schema: {wrong_units}"
+            )
+        frame = frame.rename(columns={"time": "valid_time_utc"})
+        raw_time = frame["valid_time_utc"]
+        if pd.api.types.is_numeric_dtype(raw_time):
+            frame["valid_time_utc"] = pd.to_datetime(
+                raw_time, unit="s", errors="raise", utc=True
+            )
+        else:
+            raise WeatherArchiveError(
+                "Open-Meteo Single Runs response did not honor timeformat=unixtime"
+            )
         for column in REQUESTED_VARIABLES:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        if frame["target_timestamp"].duplicated().any():
+        if frame["valid_time_utc"].duplicated().any():
             raise WeatherArchiveError("Archived forecast contains duplicate valid timestamps")
-        return frame.sort_values("target_timestamp").reset_index(drop=True)
+        return frame.sort_values("valid_time_utc").reset_index(drop=True)
 
     def get_forecast(
         self,
@@ -227,7 +261,7 @@ class OpenMeteoSingleRunsClient:
         first_target = origin + pd.Timedelta(1, unit="h")
         last_target = origin + pd.Timedelta(horizon_hours, unit="h")
         forecast = frame.loc[
-            frame["target_timestamp"].between(first_target, last_target, inclusive="both")
+            frame["valid_time_utc"].between(first_target, last_target, inclusive="both")
         ].copy()
         if len(forecast) != horizon_hours:
             raise WeatherArchiveError(
@@ -235,17 +269,21 @@ class OpenMeteoSingleRunsClient:
                 f"through {last_target}; received {len(forecast)}/{horizon_hours} hours"
             )
         expected_index = pd.date_range(first_target, last_target, freq="1h", tz="UTC")
-        if not forecast["target_timestamp"].reset_index(drop=True).array.equals(
+        if not forecast["valid_time_utc"].reset_index(drop=True).array.equals(
             pd.array(expected_index)
         ):
             raise WeatherArchiveError("Archived forecast valid times are not contiguous hourly UTC")
         if forecast[list(REQUESTED_VARIABLES)].isna().any().any():
             raise WeatherArchiveError("Archived forecast has missing requested weather values")
 
+        available_at = selected_run + pd.Timedelta(self.availability_lag_hours, unit="h")
+        if available_at > origin:
+            raise AssertionError("Selected weather run was not available at forecast origin")
         raw_hash = hashlib.sha256(raw).hexdigest()
         metadata = WeatherMetadata(
-            forecast_origin=origin.isoformat(),
-            selected_run=selected_run.isoformat(),
+            forecast_origin_utc=origin.isoformat(),
+            weather_run_init_utc=selected_run.isoformat(),
+            weather_available_at_utc=available_at.isoformat(),
             availability_cutoff=cutoff.isoformat(),
             availability_lag_hours=self.availability_lag_hours,
             model=MODEL,
@@ -257,6 +295,7 @@ class OpenMeteoSingleRunsClient:
             raw_response_sha256=raw_hash,
             request_parameters=parameters,
             cache_key=cache_key,
+            fallback_steps=0,
         )
         if not cache_hit:
             _, metadata_path = self._paths(cache_key)
@@ -274,7 +313,19 @@ class OpenMeteoSingleRunsClient:
                 )
             metadata = WeatherMetadata(**cached)
 
-        forecast["forecast_origin"] = origin
-        forecast["selected_weather_run"] = selected_run
+        forecast["forecast_origin_utc"] = origin
+        forecast["weather_run_init_utc"] = selected_run
+        forecast["weather_available_at_utc"] = available_at
+        forecast["availability_lag_hours"] = self.availability_lag_hours
+        forecast["lead_time_hours"] = (
+            (forecast["valid_time_utc"] - origin).dt.total_seconds() / 3600
+        ).astype(int)
+        forecast["model_lead_time_hours"] = (
+            (forecast["valid_time_utc"] - selected_run).dt.total_seconds() / 3600
+        ).astype(int)
+        forecast["run_age_at_origin_hours"] = int(
+            (origin - selected_run).total_seconds() / 3600
+        )
         forecast["weather_model"] = MODEL
-        return WeatherForecast(data=forecast, metadata=metadata)
+        validate_weather_samples(forecast)
+        return WeatherForecast(data=forecast, metadata=metadata, cache_hit=cache_hit)

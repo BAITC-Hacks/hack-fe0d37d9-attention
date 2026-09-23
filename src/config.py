@@ -14,10 +14,16 @@ load_dotenv(PROJECT_ROOT / ".env")
 DATA_CACHE_DIR = PROJECT_ROOT / "data" / "cache" / "weather"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 
-# The source SCADA timestamps contain no timezone offset. Phase 1 treats them as
-# UTC so they can be joined safely to UTC weather valid times. This is an explicit
-# assumption that must be revisited if organisers provide a plant-local timezone.
-SCADA_TIMEZONE = os.getenv("SCADA_TIMEZONE", "UTC")
+# SCADA source timestamps are timezone-naive. The default is civil time using
+# Asia/Almaty's historical IANA rules; fixed_offset requires a conscious, named
+# configuration. Neither mode claims to prove the organiser's source convention.
+SCADA_TIMESTAMP_MODE = os.getenv("SCADA_TIMESTAMP_MODE", "civil_time")
+SCADA_CIVIL_TIMEZONE = "Asia/Almaty"
+_fixed_offset = os.getenv("SCADA_FIXED_UTC_OFFSET_HOURS")
+SCADA_FIXED_UTC_OFFSET_HOURS = float(_fixed_offset) if _fixed_offset else None
+FORECAST_ORIGIN_CONVENTION = os.getenv(
+    "FORECAST_ORIGIN_CONVENTION", "almaty_midnight"
+)
 DEFAULT_AVAILABILITY_LAG_HOURS = int(
     os.getenv("WEATHER_AVAILABILITY_LAG_HOURS", "7")
 )
