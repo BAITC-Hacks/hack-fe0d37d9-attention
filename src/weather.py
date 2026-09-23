@@ -1,0 +1,280 @@
+"""Point-in-time Open-Meteo Single Runs client with an auditable disk cache."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict, dataclass
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import requests
+
+from .config import DATA_CACHE_DIR, DEFAULT_AVAILABILITY_LAG_HOURS
+
+
+SINGLE_RUNS_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
+PROVIDER = "Open-Meteo Single Runs API"
+MODEL = "ecmwf_ifs"
+REQUESTED_VARIABLES = (
+    "wind_speed_10m",
+    "wind_speed_80m",
+    "wind_speed_100m",
+    "wind_speed_120m",
+    "wind_direction_100m",
+    "temperature_2m",
+    "surface_pressure",
+)
+
+
+class WeatherArchiveError(RuntimeError):
+    """Raised when an archived forecast cannot be retrieved or validated."""
+
+
+def ensure_utc(value: pd.Timestamp | str) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is None:
+        return timestamp.tz_localize("UTC")
+    return timestamp.tz_convert("UTC")
+
+
+def select_latest_available_run(
+    forecast_origin: pd.Timestamp | str,
+    availability_lag_hours: int = DEFAULT_AVAILABILITY_LAG_HOURS,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Pick the latest 00/06/12/18 UTC run safely before the availability cutoff.
+
+    Open-Meteo documents that a global-model run can take about 4--6 hours to
+    become available. The configurable default is deliberately more conservative:
+    seven hours, so a run is never selected merely because it was initialised
+    before the decision time.
+    """
+    if availability_lag_hours < 0:
+        raise ValueError("availability_lag_hours must be non-negative")
+    origin = ensure_utc(forecast_origin)
+    cutoff = origin - pd.Timedelta(availability_lag_hours, unit="h")
+    selected = cutoff.floor("6h")
+    if selected > cutoff:  # Defensive invariant for any future frequency change.
+        selected -= pd.Timedelta(6, unit="h")
+    return selected, cutoff
+
+
+@dataclass(frozen=True)
+class WeatherMetadata:
+    forecast_origin: str
+    selected_run: str
+    availability_cutoff: str
+    availability_lag_hours: int
+    model: str
+    provider: str
+    latitude: float
+    longitude: float
+    requested_variables: list[str]
+    retrieval_timestamp: str
+    raw_response_sha256: str
+    request_parameters: dict[str, Any]
+    cache_key: str
+
+
+@dataclass
+class WeatherForecast:
+    data: pd.DataFrame
+    metadata: WeatherMetadata
+
+
+class OpenMeteoSingleRunsClient:
+    """Retrieve only explicitly pinned ECMWF IFS archived forecasts.
+
+    There is intentionally no fallback to reanalysis, observations, best-match,
+    or another weather model. Such a fallback would invalidate the backtest.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path = DATA_CACHE_DIR,
+        availability_lag_hours: int = DEFAULT_AVAILABILITY_LAG_HOURS,
+        timeout_seconds: int = 60,
+        session: requests.Session | None = None,
+    ) -> None:
+        self.cache_dir = Path(cache_dir)
+        self.availability_lag_hours = availability_lag_hours
+        self.timeout_seconds = timeout_seconds
+        self.session = session or requests.Session()
+
+    def _request_parameters(
+        self,
+        latitude: float,
+        longitude: float,
+        origin: pd.Timestamp,
+        selected_run: pd.Timestamp,
+        horizon_hours: int,
+    ) -> dict[str, str | int | float]:
+        # A selected run can predate origin by 7--12 hours. Request enough model
+        # lead time to include the full requested horizon, then filter locally.
+        elapsed_hours = int(
+            (origin - selected_run).total_seconds() // 3600
+        )
+        return {
+            "latitude": round(float(latitude), 6),
+            "longitude": round(float(longitude), 6),
+            "models": MODEL,
+            "run": selected_run.strftime("%Y-%m-%dT%H:%M"),
+            "timezone": "GMT",
+            "hourly": ",".join(REQUESTED_VARIABLES),
+            "forecast_hours": elapsed_hours + horizon_hours + 1,
+        }
+
+    @staticmethod
+    def _cache_key(parameters: dict[str, Any]) -> str:
+        encoded = json.dumps(parameters, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _paths(self, cache_key: str) -> tuple[Path, Path]:
+        return (
+            self.cache_dir / f"{cache_key}.json",
+            self.cache_dir / f"{cache_key}.metadata.json",
+        )
+
+    def _load_or_request(
+        self, parameters: dict[str, Any], cache_key: str
+    ) -> tuple[bytes, dict[str, Any], bool]:
+        raw_path, metadata_path = self._paths(cache_key)
+        if raw_path.exists() and metadata_path.exists():
+            raw = raw_path.read_bytes()
+            try:
+                return raw, json.loads(raw.decode("utf-8")), True
+            except (UnicodeDecodeError, ValueError) as error:
+                raise WeatherArchiveError(
+                    f"Cached archived weather response {raw_path.name} is invalid"
+                ) from error
+
+        try:
+            response = self.session.get(
+                SINGLE_RUNS_URL,
+                params=parameters,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as error:
+            raise WeatherArchiveError(
+                f"Open-Meteo archived run request failed: {error}"
+            ) from error
+        if not response.ok:
+            snippet = response.text[:500]
+            raise WeatherArchiveError(
+                f"Open-Meteo did not provide archived run {parameters['run']} "
+                f"(HTTP {response.status_code}): {snippet}"
+            )
+        raw = response.content
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise WeatherArchiveError("Open-Meteo response was not valid JSON") from error
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        raw_path.write_bytes(raw)
+        # Metadata is written by get_forecast after validation. This partial file
+        # is intentionally absent if parsing fails, so it cannot become a cache hit.
+        return raw, payload, False
+
+    @staticmethod
+    def _parse_hourly(payload: dict[str, Any]) -> pd.DataFrame:
+        hourly = payload.get("hourly")
+        if not isinstance(hourly, dict) or "time" not in hourly:
+            reason = payload.get("reason", "missing hourly time series")
+            raise WeatherArchiveError(f"Open-Meteo response lacks hourly data: {reason}")
+        frame = pd.DataFrame(hourly)
+        expected = set(REQUESTED_VARIABLES)
+        missing = expected.difference(frame.columns)
+        if missing:
+            raise WeatherArchiveError(
+                f"Archived forecast omitted requested variables: {sorted(missing)}"
+            )
+        frame = frame.rename(columns={"time": "target_timestamp"})
+        frame["target_timestamp"] = pd.to_datetime(
+            frame["target_timestamp"], errors="raise", utc=True
+        )
+        for column in REQUESTED_VARIABLES:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if frame["target_timestamp"].duplicated().any():
+            raise WeatherArchiveError("Archived forecast contains duplicate valid timestamps")
+        return frame.sort_values("target_timestamp").reset_index(drop=True)
+
+    def get_forecast(
+        self,
+        latitude: float,
+        longitude: float,
+        forecast_origin: pd.Timestamp | str,
+        horizon_hours: int = 48,
+    ) -> WeatherForecast:
+        """Return exactly the next `horizon_hours` valid UTC hours for one origin."""
+        if horizon_hours < 1:
+            raise ValueError("horizon_hours must be at least 1")
+        origin = ensure_utc(forecast_origin)
+        selected_run, cutoff = select_latest_available_run(
+            origin, self.availability_lag_hours
+        )
+        if selected_run > cutoff:
+            raise AssertionError("Selected run is after availability cutoff")
+        parameters = self._request_parameters(
+            latitude, longitude, origin, selected_run, horizon_hours
+        )
+        cache_key = self._cache_key(parameters)
+        raw, payload, cache_hit = self._load_or_request(parameters, cache_key)
+        frame = self._parse_hourly(payload)
+
+        first_target = origin + pd.Timedelta(1, unit="h")
+        last_target = origin + pd.Timedelta(horizon_hours, unit="h")
+        forecast = frame.loc[
+            frame["target_timestamp"].between(first_target, last_target, inclusive="both")
+        ].copy()
+        if len(forecast) != horizon_hours:
+            raise WeatherArchiveError(
+                f"Archived run {selected_run.isoformat()} does not cover {first_target} "
+                f"through {last_target}; received {len(forecast)}/{horizon_hours} hours"
+            )
+        expected_index = pd.date_range(first_target, last_target, freq="1h", tz="UTC")
+        if not forecast["target_timestamp"].reset_index(drop=True).array.equals(
+            pd.array(expected_index)
+        ):
+            raise WeatherArchiveError("Archived forecast valid times are not contiguous hourly UTC")
+        if forecast[list(REQUESTED_VARIABLES)].isna().any().any():
+            raise WeatherArchiveError("Archived forecast has missing requested weather values")
+
+        raw_hash = hashlib.sha256(raw).hexdigest()
+        metadata = WeatherMetadata(
+            forecast_origin=origin.isoformat(),
+            selected_run=selected_run.isoformat(),
+            availability_cutoff=cutoff.isoformat(),
+            availability_lag_hours=self.availability_lag_hours,
+            model=MODEL,
+            provider=PROVIDER,
+            latitude=float(latitude),
+            longitude=float(longitude),
+            requested_variables=list(REQUESTED_VARIABLES),
+            retrieval_timestamp=pd.Timestamp.now(tz="UTC").isoformat(),
+            raw_response_sha256=raw_hash,
+            request_parameters=parameters,
+            cache_key=cache_key,
+        )
+        if not cache_hit:
+            _, metadata_path = self._paths(cache_key)
+            metadata_path.write_text(
+                json.dumps(asdict(metadata), indent=2, sort_keys=True), encoding="utf-8"
+            )
+        else:
+            # Cache metadata is persisted provenance, including the hash of the
+            # exact raw response used for every repeated backtest invocation.
+            _, metadata_path = self._paths(cache_key)
+            cached = json.loads(metadata_path.read_text("utf-8"))
+            if cached.get("raw_response_sha256") != raw_hash:
+                raise WeatherArchiveError(
+                    f"Cached weather provenance hash does not match {cache_key}"
+                )
+            metadata = WeatherMetadata(**cached)
+
+        forecast["forecast_origin"] = origin
+        forecast["selected_weather_run"] = selected_run
+        forecast["weather_model"] = MODEL
+        return WeatherForecast(data=forecast, metadata=metadata)
